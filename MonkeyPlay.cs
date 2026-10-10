@@ -53,6 +53,7 @@ public class Monkey : Form
     [StructLayout(LayoutKind.Sequential)] struct NativeMessage { public IntPtr hwnd; public uint msg; public IntPtr w, l; public uint time; public PT p; }
     [DllImport("user32.dll")] static extern bool PeekMessage(out NativeMessage m, IntPtr hwnd, uint min, uint max, uint remove);
     [DllImport("dwmapi.dll")] static extern int DwmFlush();
+    [DllImport("user32.dll")] static extern uint MsgWaitForMultipleObjects(uint count, IntPtr[] handles, bool waitAll, uint ms, uint wake);
     [DllImport("user32.dll")] static extern int GetMessage(out NativeMessage m, IntPtr hwnd, uint min, uint max);
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
     delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr l);
@@ -95,7 +96,7 @@ public class Monkey : Form
     float lookX, lookY, lag;
 
     // Little habits it does on its own while hanging at home.
-    enum Act { None, Scratch, Look, Pump, Climb, Wave, Eat, Drink, EyeRest }
+    enum Act { None, Scratch, Look, Pump, Climb, Wave, Eat, Drink, EyeRest, Throw }
     Act act = Act.None, lastAct = Act.None;
     double actStart, actLen, nextAct = 5, waveCooldown;
     float actW;          // 0..1, eases each habit in and out
@@ -263,6 +264,7 @@ public class Monkey : Form
                 else if (key == "healthReminders" && bool.TryParse(val, out b)) healthReminders = b;
                 else if (key == "hideInFullscreen" && bool.TryParse(val, out b)) hideInFullscreen = b;
                 else if (key == "hiddenByUser" && bool.TryParse(val, out b)) hiddenByUser = b;
+                else if (key == "blastTabs" && bool.TryParse(val, out b)) blastTabs = b;
                 else if (key == "waterMinutes" && int.TryParse(val, out n) && n > 0) waterEvery = n * 60;
                 else if (key == "eyesMinutes" && int.TryParse(val, out n) && n > 0) eyesEvery = n * 60;
             }
@@ -280,6 +282,7 @@ public class Monkey : Form
                 "healthReminders=" + healthReminders,
                 "hideInFullscreen=" + hideInFullscreen,
                 "hiddenByUser=" + hiddenByUser,
+                "blastTabs=" + blastTabs,
                 "waterMinutes=" + (int)(waterEvery / 60),
                 "eyesMinutes=" + (int)(eyesEvery / 60),
             });
@@ -398,6 +401,35 @@ public class Monkey : Form
     bool Hidden { get { return hiddenForFullscreen || hiddenByUser; } }
     ToolStripMenuItem hideItem;
 
+    // "Start with Windows": an entry for this exe under the current user's Run key.
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", RunName = "MonkeyPlay";
+
+    static bool StartsWithWindows()
+    {
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey))
+            {
+                var v = k == null ? null : k.GetValue(RunName) as string;
+                return v != null && v.Trim('"').Equals(Application.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch { return false; }
+    }
+
+    static void SetStartWithWindows(bool on)
+    {
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
+                else k.DeleteValue(RunName, false);
+            }
+        }
+        catch { }
+    }
+
     void ApplyVisibility()
     {
         ShowWindow(Handle, Hidden ? 0 /* SW_HIDE */ : 4 /* SW_SHOWNOACTIVATE */);
@@ -510,6 +542,16 @@ public class Monkey : Form
     // Unselected tabs of every open Chrome/Edge window (filled by the watcher thread).
     readonly object tabLock = new object();
     Dictionary<IntPtr, List<RectangleF>> browserTabs = new Dictionary<IntPtr, List<RectangleF>>();
+    Dictionary<IntPtr, RectangleF> selectedTabs = new Dictionary<IntPtr, RectangleF>();   // the open tab of each window
+
+    // Chrome/Edge tabs overlap their neighbours by about 18px at each end, and draw the close (x) about
+    // 28px in from the right edge. Narrow tabs only show the x on the open tab.
+    const float TabOverlap = 9, WideTab = 140;
+
+    static bool OnCloseButton(PT pt, RectangleF r)
+    {
+        return pt.x >= r.Right - 37 && pt.x < r.Right - 19 && Math.Abs(pt.y - (r.Top + r.Height / 2)) <= 10;
+    }
 
     // Holding back your click on a tab until the monkey pulls it.
     HookProc hookProc;
@@ -527,13 +569,24 @@ public class Monkey : Form
     const double PullTime = 0.4;
     const int ShadowH = 18;
 
+    // Starting the app again while it's running (say, after hiding it and forgetting about hold-M)
+    // signals the running monkey to show itself.
+    static EventWaitHandle showSignal;
+
+    void ComeOut()
+    {
+        if (hiddenByUser || hideAt >= 0) ToggleHidden();
+        else { grinTime = 1.0; Say(Pick("I'm already here!", "Right here!", "Hi! Still hanging around."), true); }
+    }
+
     [STAThread]
     static void Main()
     {
         bool created;
         using (var m = new Mutex(true, "HangingMonkey_SingleInstance", out created))
+        using (showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "HangingMonkey_Show"))
         {
-            if (!created) return;
+            if (!created) { showSignal.Set(); return; }   // already running: tell it to come out instead
             Application.EnableVisualStyles();
             Application.Run(new Monkey());
         }
@@ -570,6 +623,12 @@ public class Monkey : Form
 #if SITDEMO
         nextSit = 1.5;   // test build: go and sit right away
 #endif
+#if BLASTDEMO
+        // Test build: blast a pretend tab on the tab bar a moment after starting (never clicks anything).
+        var blastDemo = new System.Windows.Forms.Timer { Interval = 2000 };
+        blastDemo.Tick += (s, e) => { blastDemo.Stop(); StartBlast(new RectangleF(home.X - 700, 8, 220, 34), new Point(-1, -1)); };
+        blastDemo.Start();
+#endif
 
         var pullItem = new ToolStripMenuItem("Monkey opens my tabs") { Checked = pullTabs, CheckOnClick = true };
         pullItem.CheckedChanged += (s, e) => { pullTabs = pullItem.Checked; SaveSettings(); };
@@ -584,6 +643,12 @@ public class Monkey : Form
         var fullItem = new ToolStripMenuItem("Hide during fullscreen") { Checked = hideInFullscreen, CheckOnClick = true };
         fullItem.CheckedChanged += (s, e) => { hideInFullscreen = fullItem.Checked; SaveSettings(); nextFullCheck = 0; };
         menu.Items.Add(fullItem);
+        var blastItem = new ToolStripMenuItem("Monkey blasts closed tabs") { Checked = blastTabs, CheckOnClick = true };
+        blastItem.CheckedChanged += (s, e) => { blastTabs = blastItem.Checked; SaveSettings(); };
+        menu.Items.Add(blastItem);
+        var startItem = new ToolStripMenuItem("Start with Windows") { Checked = StartsWithWindows(), CheckOnClick = true };
+        startItem.CheckedChanged += (s, e) => SetStartWithWindows(startItem.Checked);
+        menu.Items.Add(startItem);
         hideItem = new ToolStripMenuItem("Hide monkey (hold M)");
         hideItem.Click += (s, e) => ToggleHidden();
         menu.Items.Add(hideItem);
@@ -669,6 +734,7 @@ public class Monkey : Form
                 if ((DateTime.Now - namesReset).TotalSeconds > 30) { names.Clear(); namesReset = DateTime.Now; }
                 IntPtr fg = GetForegroundWindow();
                 var fresh = new Dictionary<IntPtr, List<RectangleF>>();
+                var selected = new Dictionary<IntPtr, RectangleF>();
 
                 foreach (IntPtr win in BrowserWindows(names))
                 {
@@ -704,6 +770,8 @@ public class Monkey : Form
                     }
                     catch { strips.Remove(win); continue; }
                     fresh[win] = others;
+                    if (!selectedRect.IsEmpty)
+                        selected[win] = new RectangleF((float)selectedRect.X, (float)selectedRect.Y, (float)selectedRect.Width, (float)selectedRect.Height);
 
                     // Swing over when you switch tabs some other way (keyboard, or a click it didn't hold).
                     if (selectedId == null) continue;
@@ -711,13 +779,14 @@ public class Monkey : Form
                     bool known = lastSelected.TryGetValue(win, out before);
                     lastSelected[win] = selectedId;
                     if (win != fg || !known || before == selectedId) continue;
+                    if (quietUntil > clock.Elapsed.TotalSeconds) continue;   // the browser picked a new tab after one was blasted
                     System.Windows.Rect r = selectedRect;
                     if (r.IsEmpty || r.Width < 1) continue;
                     var target = new PointF((float)(r.Left + r.Width / 2), (float)r.Bottom - 6);
                     BeginInvoke(new Action(() => GoToTab(target)));
                 }
 
-                lock (tabLock) browserTabs = fresh;
+                lock (tabLock) { browserTabs = fresh; selectedTabs = selected; }
                 // Forget closed windows.
                 foreach (var gone in new List<IntPtr>(strips.Keys)) if (!fresh.ContainsKey(gone)) strips.Remove(gone);
             }
@@ -738,16 +807,43 @@ public class Monkey : Form
 
     IntPtr OnMouseHook(int code, IntPtr w, IntPtr l)
     {
-        if (code >= 0 && pullTabs && !Hidden)
+        if (code >= 0 && (pullTabs || blastTabs) && !Hidden)
         {
             int msg = (int)w;
             var info = (MSLL)Marshal.PtrToStructure(l, typeof(MSLL));
             bool injected = (info.flags & 1) != 0;   // our own replayed click passes straight through
+#if CLICKTEST
+            // Test build: simulated clicks never reach the browser; say what they would have done.
+            if (injected && (msg == 0x201 || msg == 0x202))
+            {
+                if (msg == 0x201)
+                {
+                    RectangleF ct;
+                    bool onClose = FindCloseButton(info.pt, out ct);
+                    System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_clicktest.txt"),
+                        info.pt.x + "," + info.pt.y + " close=" + onClose + " mode=" + mode + " blastPhase=" + blastPhase + Environment.NewLine);
+                    if (onClose && blastTabs && blastPhase == 0 && mode == Mode.Home)
+                    {
+                        var cp0 = new Point(info.pt.x, info.pt.y);
+                        BeginInvoke(new Action(() => StartBlast(ct, cp0)));
+                    }
+                }
+                return (IntPtr)1;
+            }
+#endif
             if (!injected)
             {
                 if (msg == 0x202 /* LBUTTONUP */ && swallowUp) { swallowUp = false; return (IntPtr)1; }
                 RectangleF tab;
-                if (msg == 0x201 /* LBUTTONDOWN */ && !grabbed && mode != Mode.PullDown && FindTab(info.pt, out tab))
+                if (msg == 0x201 && blastTabs && blastPhase == 0 && mode == Mode.Home && !grabbed && !PerchedPose && sleepW < 0.5f
+                    && FindCloseButton(info.pt, out tab))
+                {
+                    swallowUp = true;
+                    var cp = new Point(info.pt.x, info.pt.y);
+                    BeginInvoke(new Action(() => StartBlast(tab, cp)));
+                    return (IntPtr)1;
+                }
+                if (msg == 0x201 /* LBUTTONDOWN */ && pullTabs && !grabbed && mode != Mode.PullDown && FindTab(info.pt, out tab))
                 {
                     swallowUp = true;
                     var p = new Point(info.pt.x, info.pt.y);
@@ -757,6 +853,239 @@ public class Monkey : Form
             }
         }
         return CallNextHookEx(hook, code, w, l);
+    }
+
+    // ---- Blasting closed tabs ----
+    // Click a tab's close (x) and the monkey flings a banana at it: BOOM, the tab flies apart, and your
+    // click goes through at the moment of impact so the tab really closes under the explosion.
+
+    bool blastTabs = true;
+    volatile int blastPhase;      // 0 idle, 1 winding up, 2 banana flying, 3 exploding
+    double blastStart, flightStart, boomStart, quietUntil;
+    RectangleF blastTab;
+    Point blastClick;
+    PointF blastFrom, blastAt, throwDir = new PointF(-1, 0), handScreen;
+    Bitmap tabShot;
+    FxLayer fx = new FxLayer();
+    Bitmap fxBmp;
+    Rectangle fxArea;
+    const double ThrowWind = 0.32, FlightTime = 0.42, BoomTime = 1.1;
+
+    struct Bit { public PointF p, v; public float a, spin; public RectangleF src; }
+    Bit[] debris = new Bit[0];
+
+    // The close button is the little x near a tab's right end (narrow tabs only show one on the open tab).
+    bool FindCloseButton(PT pt, out RectangleF hit)
+    {
+        hit = RectangleF.Empty;
+        IntPtr under = GetAncestor(WindowFromPoint(pt), 2 /* GA_ROOT */);
+        lock (tabLock)
+        {
+            RectangleF open;
+            if (selectedTabs.TryGetValue(under, out open) && OnCloseButton(pt, open)) { hit = open; return true; }
+            List<RectangleF> tabs;
+            if (browserTabs.TryGetValue(under, out tabs))
+                foreach (var r in tabs)
+                    if (r.Width >= WideTab && OnCloseButton(pt, r)) { hit = r; return true; }
+        }
+        return false;
+    }
+
+    void StartBlast(RectangleF tab, Point click)
+    {
+        double now = clock.Elapsed.TotalSeconds;
+        blastTab = tab; blastClick = click;
+        blastAt = new PointF(tab.X + tab.Width / 2, tab.Y + tab.Height / 2);
+        try
+        {
+            if (tabShot != null) tabShot.Dispose();
+            tabShot = new Bitmap(Math.Max(1, (int)tab.Width), Math.Max(1, (int)tab.Height), PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(tabShot)) g.CopyFromScreen((int)tab.X, (int)tab.Y, 0, 0, tabShot.Size);
+        }
+        catch { tabShot = null; }
+        float hx = anchor.X + (float)x, hy = anchor.Y + (float)y;
+        float ddx = blastAt.X - hx, ddy = blastAt.Y - hy, len = Math.Max(1, (float)Math.Sqrt(ddx * ddx + ddy * ddy));
+        throwDir = new PointF(ddx / len, ddy / len);
+        handScreen = new PointF(hx, hy);
+        StartAct(Act.Throw, 0.9, now);
+        grinTime = 0.9;
+        Say(Pick("Bye bye, tab!", "Target locked!", "Fire in the hole!", "This one's mine!"), true);
+        blastStart = now;
+        blastPhase = 1;
+    }
+
+    void UpdateBlast(double now)
+    {
+        if (blastPhase == 0) return;
+        if (blastPhase == 1 && now - blastStart >= ThrowWind)
+        {
+            // Let go of the banana: it flies from the hand to the tab.
+            blastFrom = handScreen;
+            Rectangle scr = Screen.PrimaryScreen.Bounds;
+            int left = (int)Math.Min(blastFrom.X, blastAt.X) - 170, right = (int)Math.Max(blastFrom.X, blastAt.X) + 170;
+            int top = Math.Max(scr.Top, (int)Math.Min(blastFrom.Y, blastAt.Y) - 200), bottom = (int)Math.Max(blastFrom.Y, blastAt.Y) + 230;
+            fxArea = Rectangle.FromLTRB(left, top, right, bottom);
+            if (fxBmp != null) fxBmp.Dispose();
+            fxBmp = new Bitmap(fxArea.Width, fxArea.Height, PixelFormat.Format32bppArgb);
+            flightStart = now;
+            blastPhase = 2;
+        }
+        if (blastPhase == 2 && now - flightStart >= FlightTime)
+        {
+            // Impact: close the tab for real, and blow its picture to bits.
+            ReplayClick(blastClick);
+            quietUntil = now + 2;
+            boomStart = now;
+            blastPhase = 3;
+            MakeDebris();
+            grinTime = 1.2;
+            if (rnd.NextDouble() < 0.6) Say(Pick("BOOM!", "Kaboom!", "Got it!", "Bullseye!"), true);
+        }
+        if (blastPhase >= 2) DrawFx(now);
+        if (blastPhase == 3 && now - boomStart >= BoomTime)
+        {
+            fx.Hide();
+            if (tabShot != null) { tabShot.Dispose(); tabShot = null; }
+            blastPhase = 0;
+        }
+    }
+
+    // The tab's picture in pieces, flying out from the blast.
+    void MakeDebris()
+    {
+        const int cols = 4, rows = 2;
+        debris = new Bit[cols * rows];
+        for (int i = 0; i < debris.Length; i++)
+        {
+            float cw = blastTab.Width / cols, ch = blastTab.Height / rows;
+            var src = new RectangleF((i % cols) * cw, (i / cols) * ch, cw, ch);
+            var center = new PointF(blastTab.X + src.X + cw / 2, blastTab.Y + src.Y + ch / 2);
+            float ang = (float)Math.Atan2(center.Y - blastAt.Y + (float)rnd.NextDouble() * 6 - 3, center.X - blastAt.X + 0.01f);
+            float speed = 260 + (float)rnd.NextDouble() * 320;
+            debris[i] = new Bit { p = center, v = new PointF((float)Math.Cos(ang) * speed, (float)Math.Sin(ang) * speed - 280), a = 0,
+                spin = ((float)rnd.NextDouble() - 0.5f) * 1400, src = src };
+        }
+    }
+
+    void DrawFx(double now)
+    {
+        using (var g = Graphics.FromImage(fxBmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Color.Transparent);
+            g.TranslateTransform(-fxArea.Left, -fxArea.Top);   // draw in screen coordinates
+
+            if (blastPhase == 2)
+            {
+                // The banana, spinning along an arc, with a little trail.
+                float u = (float)Math.Min(1, (now - flightStart) / FlightTime);
+                float dist = (float)Math.Sqrt(Math.Pow(blastAt.X - blastFrom.X, 2) + Math.Pow(blastAt.Y - blastFrom.Y, 2));
+                for (int i = 4; i >= 0; i--)
+                {
+                    float uu = Math.Max(0, u - i * 0.035f);
+                    var pt = Lerp(blastFrom, blastAt, uu);
+                    pt.Y -= (float)Math.Sin(Math.PI * uu) * Math.Min(140, dist * 0.18f);
+                    if (i > 0)
+                        using (var b = new SolidBrush(Color.FromArgb(90 - i * 16, 255, 225, 90))) g.FillEllipse(b, pt.X - 7 + i, pt.Y - 7 + i, 14 - 2 * i, 14 - 2 * i);
+                    else DrawBanana(g, new PointF(pt.X, pt.Y + 10), (float)((now - flightStart) * 1100), 1, 0, 1, false);
+                }
+            }
+            else
+            {
+                float a = (float)(now - boomStart);
+                var c = blastAt;
+
+                // Smoke puffs drifting up and fading.
+                for (int i = 0; i < 7; i++)
+                {
+                    double ang = i * 2 * Math.PI / 7 + 0.4;
+                    float k = (float)Math.Min(1, a / BoomTime), rr = 14 + 40 * Smooth(a / 0.6);
+                    float px = c.X + (float)Math.Cos(ang) * (18 + 50 * k), py = c.Y + (float)Math.Sin(ang) * (12 + 30 * k) - 40 * k;
+                    int al = (int)(150 * Math.Max(0, 1 - k) * Math.Min(1, a / 0.1));
+                    using (var b = new SolidBrush(Color.FromArgb(al, 120, 120, 125))) g.FillEllipse(b, px - rr, py - rr, rr * 2, rr * 2);
+                }
+
+                // Pieces of the tab flying apart and falling.
+                if (tabShot != null)
+                    for (int i = 0; i < debris.Length; i++)
+                    {
+                        var d = debris[i];
+                        var pos = new PointF(d.p.X + d.v.X * a, d.p.Y + d.v.Y * a + 900 * a * a / 2);
+                        var st = g.Save();
+                        g.TranslateTransform(pos.X, pos.Y);
+                        g.RotateTransform(d.spin * a);
+                        float fade = (float)Math.Max(0, Math.Min(1, (BoomTime - a) / 0.4));
+                        var cm = new System.Drawing.Imaging.ColorMatrix { Matrix33 = fade };
+                        using (var ia = new ImageAttributes())
+                        {
+                            ia.SetColorMatrix(cm);
+                            g.DrawImage(tabShot, new Rectangle((int)(-d.src.Width / 2), (int)(-d.src.Height / 2), (int)d.src.Width, (int)d.src.Height),
+                                d.src.X, d.src.Y, d.src.Width, d.src.Height, GraphicsUnit.Pixel, ia);
+                        }
+                        g.Restore(st);
+                    }
+
+                // A quick white flash.
+                if (a < 0.14f)
+                {
+                    float rr = 12 + 380 * a;
+                    using (var b = new SolidBrush(Color.FromArgb((int)(230 * (1 - a / 0.14f)), 255, 255, 235))) g.FillEllipse(b, c.X - rr, c.Y - rr, rr * 2, rr * 2);
+                }
+
+                // The cartoon burst: an orange star with a yellow heart.
+                if (a < 0.5f)
+                {
+                    float grow = Smooth(a / 0.16f), fade = Math.Max(0, Math.Min(1, (0.5f - a) / 0.25f));
+                    DrawStar(g, c, 22 + 92 * grow, 0.55f, 12, a * 40, Color.FromArgb((int)(255 * fade), 255, 128, 20));
+                    DrawStar(g, c, 14 + 58 * grow, 0.6f, 10, -a * 60, Color.FromArgb((int)(255 * fade), 255, 225, 60));
+                }
+
+                // Sparks shooting out.
+                if (a < 0.45f)
+                    for (int i = 0; i < 16; i++)
+                    {
+                        double ang = i * 2 * Math.PI / 16 + (i % 2) * 0.2;
+                        float r0 = 30 + 260 * a, r1 = r0 + 18;
+                        int al = (int)(255 * (1 - a / 0.45f));
+                        using (var pn = RoundPen(Color.FromArgb(al, 255, 210, 80), 3f))
+                            g.DrawLine(pn, c.X + (float)Math.Cos(ang) * r0, c.Y + (float)Math.Sin(ang) * r0, c.X + (float)Math.Cos(ang) * r1, c.Y + (float)Math.Sin(ang) * r1);
+                    }
+
+                // "BOOM!" pops up.
+                if (a > 0.04f && a < 0.75f)
+                {
+                    float pop = a < 0.14f ? 0.6f + 2.8f * (a - 0.04f) : 1f, fade = Math.Max(0, Math.Min(1, (0.75f - a) / 0.2f));
+                    var st = g.Save();
+                    g.TranslateTransform(c.X, c.Y - 6);
+                    g.RotateTransform(-8);
+                    g.ScaleTransform(pop, pop);
+                    using (var path = new GraphicsPath())
+                    using (var ff = new FontFamily("Arial Black"))
+                    {
+                        path.AddString("BOOM!", ff, (int)FontStyle.Bold, 30, new PointF(0, 0), new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center });
+                        using (var o = new Pen(Color.FromArgb((int)(255 * fade), 90, 25, 10), 5f) { LineJoin = LineJoin.Round }) g.DrawPath(o, path);
+                        using (var b = new SolidBrush(Color.FromArgb((int)(255 * fade), 255, 255, 255))) g.FillPath(b, path);
+                    }
+                    g.Restore(st);
+                }
+            }
+        }
+        if (!fx.Visible) fx.Show();
+        Monkey.Layer(fx.Handle, fxBmp, fxArea.Location);
+        if (!Hidden) KeepOnTop();   // the monkey stays in front of its own blast
+    }
+
+    static void DrawStar(Graphics g, PointF c, float r, float inner, int points, float turn, Color col)
+    {
+        var pts = new PointF[points * 2];
+        for (int i = 0; i < pts.Length; i++)
+        {
+            double ang = (turn + i * 180.0 / points) * Math.PI / 180;
+            float rr = i % 2 == 0 ? r : r * inner;
+            pts[i] = new PointF(c.X + (float)Math.Cos(ang) * rr, c.Y + (float)Math.Sin(ang) * rr);
+        }
+        using (var b = new SolidBrush(col)) g.FillPolygon(b, pts);
+        using (var o = new Pen(Color.FromArgb(col.A, 120, 45, 10), 2f) { LineJoin = LineJoin.Round }) g.DrawPolygon(o, pts);
     }
 
     bool FindTab(PT pt, out RectangleF hit)
@@ -769,9 +1098,9 @@ public class Monkey : Form
             if (!browserTabs.TryGetValue(under, out tabs)) return false;
             foreach (var r in tabs)
             {
-                // Leave the tab's close (x) button alone (narrow tabs don't show one).
-                float right = r.Width >= 90 ? r.Right - 22 : r.Right;
-                if (pt.x >= r.Left && pt.x < right && pt.y >= r.Top && pt.y < r.Bottom) { hit = r; pendingWindow = under; return true; }
+                // Leave the tab's close (x) button alone (narrow tabs don't show one), and the ends it shares with its neighbours.
+                if (r.Width >= WideTab && OnCloseButton(pt, r)) continue;
+                if (pt.x >= r.Left + TabOverlap && pt.x < r.Right - TabOverlap && pt.y >= r.Top && pt.y < r.Bottom) { hit = r; pendingWindow = under; return true; }
             }
         }
         return false;
@@ -792,7 +1121,7 @@ public class Monkey : Form
     void ReplayClick(Point at)
     {
         hasPending = false;
-#if DEMO
+#if DEMO || BLASTDEMO || CLICKTEST
         return;   // test build never clicks anything
 #endif
         Point pendingPt = at;
@@ -1088,6 +1417,18 @@ public class Monkey : Form
         });
         t.IsBackground = true;
         t.Start();
+
+        var waiter = new Thread(() =>
+        {
+            try
+            {
+                while (showSignal.WaitOne())
+                    if (!IsDisposed) BeginInvoke((Action)ComeOut);
+            }
+            catch { }   // the app is closing
+        });
+        waiter.IsBackground = true;
+        waiter.Start();
     }
 
     protected override void WndProc(ref Message m)
@@ -1153,15 +1494,36 @@ public class Monkey : Form
 
     static float Ease(double rate, double dt) { return (float)(1 - Math.Exp(-rate * dt)); }
 
-    // Runs one frame per screen refresh while the app is otherwise idle.
+    // Runs the animation while the app is otherwise idle: in step with the screen, but at most 60 frames
+    // a second (30 on battery), and only a few times a second, without drawing, while it's hidden.
     void RunLoop(object s, EventArgs e)
     {
         NativeMessage m;
         while (!IsDisposed && !PeekMessage(out m, IntPtr.Zero, 0, 0, 0))
         {
+            double start = clock.Elapsed.TotalSeconds;
             Frame();
-            if (DwmFlush() != 0) Thread.Sleep(8);   // wait for the next screen refresh
+            double interval = Hidden ? 0.2 : onBattery ? 1 / 30.0 : 1 / 60.0;
+            if (Hidden)
+            {
+                // Sleep, but wake straight away for clicks, the menu or hold-M.
+                int ms = (int)Math.Max(1, (interval - (clock.Elapsed.TotalSeconds - start)) * 1000);
+                MsgWaitForMultipleObjects(0, null, false, (uint)ms, 0x04FF /* QS_ALLINPUT */);
+                continue;
+            }
+            do { if (DwmFlush() != 0) Thread.Sleep(8); }   // wait for the next screen refresh
+            while (clock.Elapsed.TotalSeconds - start < interval - 0.003 && !IsDisposed);
         }
+    }
+
+    bool onBattery;
+    double nextPowerCheck;
+
+    void CheckPower(double now)
+    {
+        if (now < nextPowerCheck) return;
+        nextPowerCheck = now + 5;
+        onBattery = SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Offline;
     }
 
     void Frame()
@@ -1177,6 +1539,7 @@ public class Monkey : Form
         UpdateDance(now, dt);
         UpdateHabits(now, dt);
         UpdatePerch(now);
+        UpdateBlast(now);
         UpdateChat(now, dt);
 
         double ropeTarget = HandPose ? ArmLen : L, ropeRate = 7;
@@ -1230,6 +1593,7 @@ public class Monkey : Form
 
         UpdateBranchBend(dt);
         CheckFullscreen(now);
+        CheckPower(now);
         if (hideAt >= 0 && now >= hideAt) { hideAt = -1; hiddenByUser = true; ApplyVisibility(); SaveSettings(); }
         if (now >= nextTopCheck || (topAgainAt >= 0 && now >= topAgainAt))
         {
@@ -1275,7 +1639,7 @@ public class Monkey : Form
         if (blinkTime > 0) blinkTime -= dt;
         else if ((nextBlink -= dt) <= 0) { blinkTime = 0.14; nextBlink = 2.5 + rnd.NextDouble() * 4; }
 
-        Render();
+        if (!Hidden) Render();   // nothing to draw while it's put away
     }
 
     // Reads how loud the speakers are, about 50 times a second (background thread).
@@ -2323,6 +2687,12 @@ public class Monkey : Form
         double ap = clock.Elapsed.TotalSeconds - actStart;
         if (shown == Act.Scratch)
             tR = new PointF(23, 54 + (float)Math.Sin(t * 22) * 3);                      // scratching its head
+        if (shown == Act.Throw)
+        {
+            // Wind the arm back, then fling it toward the tab and follow through.
+            PointF back = new PointF(46, 98), fling = new PointF(8 + throwDir.X * 58, 60 + throwDir.Y * 58);
+            tR = ap < ThrowWind ? Lerp(restR, back, Smooth(ap / ThrowWind)) : Lerp(back, fling, Smooth((ap - ThrowWind) / 0.12));
+        }
         bool climbing = shown == Act.Climb && ap < ClimbLetGo + 0.4;
         bool gripL = false, gripR = false;
         float angL = 0, angR = 0;
@@ -2397,6 +2767,13 @@ public class Monkey : Form
             hR = Lerp(hR, r, danceW);
         }
         bool scratchInFront = shown == Act.Scratch && actW > 0.3f;
+        {
+            // Where its throwing hand is on the screen (the banana leaves from here).
+            var hp = new[] { hR };
+            g.Transform.TransformPoints(hp);
+            Point wpos = WindowPos;
+            handScreen = new PointF(hp[0].X + wpos.X, hp[0].Y + wpos.Y);
+        }
 
         ArmTo(g, new PointF(-16, 30), hL, -1);
         if (eating || drinking)
@@ -2429,6 +2806,8 @@ public class Monkey : Form
 #endif
         if (scratchInFront) ArmTo(g, new PointF(16, 30), hR, 1);
 
+        if (shown == Act.Throw && ap < ThrowWind && actW > 0.3f)   // the banana it's about to throw
+            DrawBanana(g, hR, (float)(Math.Atan2(throwDir.X, -throwDir.Y) * 180 / Math.PI), 1, 0, 1);
         if (eating)
         {
             if (ap < TossTime)
@@ -3059,6 +3438,30 @@ public class Monkey : Form
             ReleaseDC(IntPtr.Zero, screen);
         }
     }
+}
+
+// A click-through window the tab blast is drawn in.
+class FxLayer : Form
+{
+    public FxLayer()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = true;
+        StartPosition = FormStartPosition.Manual;
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x80000 | 0x20 | 0x08000000 | 0x80 | 0x8; // LAYERED | TRANSPARENT | NOACTIVATE | TOOLWINDOW | TOPMOST
+            return cp;
+        }
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
 }
 
 // A click-through window showing the old page while the monkey pulls it down.
