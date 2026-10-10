@@ -13,6 +13,7 @@ A cartoon monkey in shades and a puffer jacket that lives on your Windows deskto
 - **Opens browser tabs:** click a tab in Chrome or Edge and the monkey swings over, pulls the old page down off the screen to reveal your tab, then climbs back to its branch.
 - **Blasts closed tabs:** click a tab's close (×) and the monkey flings a banana at it. BOOM: the tab flies apart and closes.
 - **Stays out of the way:** stays on top of other windows, hides during fullscreen video and games, and can be put away at any time.
+- **Works with several screens:** choose which screen it lives on; it's drawn crisp at that screen's scaling (100%, 125%, 150%...).
 
 ## Controls
 
@@ -27,7 +28,13 @@ A cartoon monkey in shades and a puffer jacket that lives on your Windows deskto
 
 Holding M types one "m" if you're in a text box, and M doesn't key-repeat while held.
 
-Right-click menu options: **Monkey opens my tabs**, **Monkey blasts closed tabs**, **Water & blink reminders**, **Water every**, **Eye break every**, **Hide during fullscreen**, **Start with Windows**, **Hide monkey**, **Quit monkey**. Choices are saved in `%APPDATA%\MonkeyPlay\settings.txt`.
+Right-click menu options: **Monkey opens my tabs**, **Water & blink reminders**, **Water every**, **Eye break every**, **Hide during fullscreen**, **Live on screen**, **Monkey blasts closed tabs**, **Start with Windows**, **Hide monkey**, **Quit monkey**. Choices are saved in `%APPDATA%\MonkeyPlay\settings.txt`.
+
+## Download
+
+Get `Monkey-Play.exe` from the [latest release](https://github.com/binumadhavan2-prog/monkey-play/releases/latest) and run it. There's nothing to install.
+
+The exe isn't digitally signed, so the first time Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**.
 
 ## Build
 
@@ -60,4 +67,5 @@ For example: `build.cmd -define:SITDEMO`
 ## Notes
 
 - To hold your tab clicks and to notice hold-M, the monkey watches the mouse and keyboard system-wide (nothing is recorded or sent anywhere). Because the exe is unsigned, some antivirus tools may flag that.
-- It uses your main monitor.
+- Battery and CPU: while visible it uses roughly 20-25% of one CPU core (it runs at 30 frames a second when calm, 60 when moving fast, and fewer on battery). Hidden (hold M), it uses almost nothing.
+- It lives on your main screen unless you pick another under **Live on screen**.
