@@ -41,6 +41,7 @@ public class Monkey : Form
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr hMod, uint thread);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
@@ -67,8 +68,8 @@ public class Monkey : Form
     [StructLayout(LayoutKind.Sequential)] struct MSLL { public PT pt; public uint mouseData, flags, time; public IntPtr extra; }
 
     // Window geometry. The tail is wrapped around a branch at (PX, PY).
-    const int W = 440, H = 360;
-    const float PX = W / 2f, PY = 14;
+    const int W = 440, H = 470;
+    const float PX = W / 2f, PY = 124;   // the branch is this far down the screen, leaving room to sit on top of it
     const int BodyReach = 100;      // how far the body extends below the hips
     const double L = 110;           // tail rest length (branch to hips)
     const double ArmLen = 42;       // arm length when it hangs from a tab by its hand
@@ -261,6 +262,7 @@ public class Monkey : Form
                 if (key == "pullTabs" && bool.TryParse(val, out b)) pullTabs = b;
                 else if (key == "healthReminders" && bool.TryParse(val, out b)) healthReminders = b;
                 else if (key == "hideInFullscreen" && bool.TryParse(val, out b)) hideInFullscreen = b;
+                else if (key == "hiddenByUser" && bool.TryParse(val, out b)) hiddenByUser = b;
                 else if (key == "waterMinutes" && int.TryParse(val, out n) && n > 0) waterEvery = n * 60;
                 else if (key == "eyesMinutes" && int.TryParse(val, out n) && n > 0) eyesEvery = n * 60;
             }
@@ -277,6 +279,7 @@ public class Monkey : Form
                 "pullTabs=" + pullTabs,
                 "healthReminders=" + healthReminders,
                 "hideInFullscreen=" + hideInFullscreen,
+                "hiddenByUser=" + hiddenByUser,
                 "waterMinutes=" + (int)(waterEvery / 60),
                 "eyesMinutes=" + (int)(eyesEvery / 60),
             });
@@ -386,8 +389,84 @@ public class Monkey : Form
         bool full = hideInFullscreen && SomethingFullscreen();
         if (full == hiddenForFullscreen) return;
         hiddenForFullscreen = full;
-        ShowWindow(Handle, full ? 0 /* SW_HIDE */ : 4 /* SW_SHOWNOACTIVATE */);
-        if (!full) KeepOnTop();
+        ApplyVisibility();
+    }
+
+    // Put away or brought back by holding M (or from the menu); remembered between runs.
+    volatile bool hiddenByUser;
+    double hideAt = -1;   // waves goodbye first, then goes
+    bool Hidden { get { return hiddenForFullscreen || hiddenByUser; } }
+    ToolStripMenuItem hideItem;
+
+    void ApplyVisibility()
+    {
+        ShowWindow(Handle, Hidden ? 0 /* SW_HIDE */ : 4 /* SW_SHOWNOACTIVATE */);
+        if (!Hidden) KeepOnTop();
+        if (hideItem != null) hideItem.Text = hiddenByUser ? "Show monkey (hold M)" : "Hide monkey (hold M)";
+    }
+
+    void ToggleHidden()
+    {
+        double now = clock.Elapsed.TotalSeconds;
+        if (hiddenByUser || hideAt >= 0)
+        {
+            hiddenByUser = false; hideAt = -1;
+            ApplyVisibility();
+            SaveSettings();
+            grinTime = 1.0;
+            Say(Pick("I'm back!", "Did you miss me?", "Hello again!"), true);
+        }
+        else
+        {
+            Say(Pick("See you later!", "Bye for now!", "Off I go!"), true);
+            grinTime = 0.8;
+            hideAt = now + 0.9;
+        }
+    }
+
+    // Holding M (no Ctrl/Alt/Win) for a moment, anywhere, shows or hides the monkey. A quick tap types
+    // as usual; while M is held down its key-repeats are swallowed so it doesn't type "mmmm".
+    HookProc keyProc;
+    IntPtr keyHook;
+    bool mHeld, mToggled;
+    int mDownAt;
+    const int HoldMs = 700;
+
+    [StructLayout(LayoutKind.Sequential)] struct KBDLLHOOKSTRUCT { public uint vk, scan, flags, time; public IntPtr extra; }
+
+    IntPtr OnKeyHook(int code, IntPtr w, IntPtr l)
+    {
+        if (code >= 0)
+        {
+            var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(l, typeof(KBDLLHOOKSTRUCT));
+            int msg = (int)w;
+            bool injected = (k.flags & 0x10) != 0;
+#if KEYTEST
+            injected = false;   // test build: accept simulated key presses
+#endif
+            if (k.vk == 0x4D /* M */ && !injected)
+            {
+                if (msg == 0x100 || msg == 0x104)   // key down (and its repeats)
+                {
+                    bool mods = GetAsyncKeyState(0x11) < 0 || GetAsyncKeyState(0x12) < 0 || GetAsyncKeyState(0x5B) < 0 || GetAsyncKeyState(0x5C) < 0;
+                    if (!mHeld)
+                    {
+                        if (!mods) { mHeld = true; mToggled = false; mDownAt = Environment.TickCount; }
+                    }
+                    else
+                    {
+                        if (!mToggled && Environment.TickCount - mDownAt >= HoldMs)
+                        {
+                            mToggled = true;
+                            BeginInvoke((Action)ToggleHidden);
+                        }
+                        return (IntPtr)1;   // swallow the repeats
+                    }
+                }
+                else if (msg == 0x101 || msg == 0x105) mHeld = false;   // key up
+            }
+        }
+        return CallNextHookEx(keyHook, code, w, l);
     }
 
     // Is the window in front covering the whole screen the monkey lives on? (The desktop doesn't count.)
@@ -488,6 +567,9 @@ public class Monkey : Form
 #if DRINKDEMO
         nextWater = 1;   // test build: water break right away
 #endif
+#if SITDEMO
+        nextSit = 1.5;   // test build: go and sit right away
+#endif
 
         var pullItem = new ToolStripMenuItem("Monkey opens my tabs") { Checked = pullTabs, CheckOnClick = true };
         pullItem.CheckedChanged += (s, e) => { pullTabs = pullItem.Checked; SaveSettings(); };
@@ -502,7 +584,11 @@ public class Monkey : Form
         var fullItem = new ToolStripMenuItem("Hide during fullscreen") { Checked = hideInFullscreen, CheckOnClick = true };
         fullItem.CheckedChanged += (s, e) => { hideInFullscreen = fullItem.Checked; SaveSettings(); nextFullCheck = 0; };
         menu.Items.Add(fullItem);
+        hideItem = new ToolStripMenuItem("Hide monkey (hold M)");
+        hideItem.Click += (s, e) => ToggleHidden();
+        menu.Items.Add(hideItem);
         menu.Items.Add("Quit monkey", null, (s, e) => Close());
+        Shown += (s, e) => ApplyVisibility();   // starts hidden if it was put away last time
         MouseDown += OnDown;
         MouseUp += OnUp;
 
@@ -652,7 +738,7 @@ public class Monkey : Form
 
     IntPtr OnMouseHook(int code, IntPtr w, IntPtr l)
     {
-        if (code >= 0 && pullTabs && !hiddenForFullscreen)
+        if (code >= 0 && pullTabs && !Hidden)
         {
             int msg = (int)w;
             var info = (MSLL)Marshal.PtrToStructure(l, typeof(MSLL));
@@ -730,9 +816,36 @@ public class Monkey : Form
         travelFrom = anchor; travelTo = to;
         travelStart = clock.Elapsed.TotalSeconds;
         double dist = Math.Sqrt(Math.Pow(to.X - anchor.X, 2) + Math.Pow(to.Y - anchor.Y, 2));
-        PlanSwings(dist, m == Mode.ToTab);
+        if (m == Mode.ToHome) PlanClimbHome(dist);
+        else PlanSwings(dist, m == Mode.ToTab);
         lastStep = -1;
         mode = m;
+    }
+
+    // Going home after opening a tab there's no hurry, so it climbs back hand over hand: a ladder of
+    // holds up to the branch, zig-zagging a little. Each step: both hands hold while the body swings
+    // up, then the lower hand lets go and reaches past the other for the next hold, and they swap.
+    PointF[] homeHolds = new PointF[0];
+    int homeStep;            // the hold the holding hand is on
+    double homeStepStart;
+    PointF freeFrom;         // where the free hand let go
+    PointF freeHandAt;       // where the free hand is now (screen)
+    const double HomeStepTime = 0.36, HomeHang = 0.4;   // seconds per step; part of it spent hanging on with both hands
+
+    void PlanClimbHome(double dist)
+    {
+        int n = (int)Math.Max(2, Math.Min(14, Math.Round(dist / 85)));
+        homeHolds = new PointF[n + 1];
+        for (int i = 0; i <= n; i++)
+        {
+            float k = i / (float)n;
+            var h = new PointF(travelFrom.X + (travelTo.X - travelFrom.X) * k, travelFrom.Y + (travelTo.Y - travelFrom.Y) * k);
+            if (i > 0 && i < n) h.X += (i % 2 == 0 ? -1 : 1) * 14;
+            homeHolds[i] = h;
+        }
+        homeStep = 0;
+        homeStepStart = clock.Elapsed.TotalSeconds;
+        freeFrom = freeHandAt = anchor;
     }
 
     // 'hurry' = on the way to a tab you clicked: fewer, quicker swings and no idle pauses.
@@ -776,7 +889,29 @@ public class Monkey : Form
 
     void UpdateAnchor(double now)
     {
-        if (mode == Mode.ToTab || mode == Mode.ToHome)
+        if (mode == Mode.ToHome)
+        {
+            double u = (now - homeStepStart) / HomeStepTime;
+            float reach = Smooth((u - HomeHang) / (1 - HomeHang));
+            swingReach = reach;
+            nextGrip = homeHolds[homeStep + 1];
+            // The free hand travels from where it let go to the next hold, swinging out a little on the way.
+            freeHandAt = Lerp(freeFrom, nextGrip, reach);
+            freeHandAt.X += -mirror * 16 * (float)Math.Sin(Math.PI * reach);
+            if (u >= 1)
+            {
+                // Caught it: that hand now holds, the other one becomes the free hand.
+                freeFrom = homeHolds[homeStep];
+                homeStep++;
+                mirror = -mirror;
+                MoveAnchor(homeHolds[homeStep]);   // the body stays put and swings up to the new hold
+                vy -= 160;
+                vx += Math.Sign(travelTo.X - travelFrom.X) * 40;
+                homeStepStart = now;
+                if (homeStep == homeHolds.Length - 1) mode = Mode.Home;
+            }
+        }
+        else if (mode == Mode.ToTab)
         {
             // Hand over hand, unevenly: each planned swing reaches, then hangs for its own beat.
             double el = now - travelStart;
@@ -946,6 +1081,8 @@ public class Monkey : Form
         {
             hookProc = OnMouseHook;   // keep a reference so it is not garbage collected
             hook = SetWindowsHookEx(14 /* WH_MOUSE_LL */, hookProc, GetModuleHandle(null), 0);
+            keyProc = OnKeyHook;
+            keyHook = SetWindowsHookEx(13 /* WH_KEYBOARD_LL */, keyProc, GetModuleHandle(null), 0);
             NativeMessage m;
             while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
         });
@@ -975,6 +1112,7 @@ public class Monkey : Form
     {
         UnregisterHotKey(Handle, TerminalHotkey);
         if (hook != IntPtr.Zero) UnhookWindowsHookEx(hook);
+        if (keyHook != IntPtr.Zero) UnhookWindowsHookEx(keyHook);
         if (foregroundHook != IntPtr.Zero) UnhookWinEvent(foregroundHook);
         base.OnFormClosed(e);
     }
@@ -983,6 +1121,7 @@ public class Monkey : Form
     {
         if (e.Button == MouseButtons.Right) { menu.Show(Cursor.Position); return; }
         if (e.Button != MouseButtons.Left) return;
+        if (PerchedPose || perch == Perch.Up) LeavePerchNow(clock.Elapsed.TotalSeconds);   // pulled off its seat
         grabbed = true; moved = false;
         downAt = e.Location; downTime = clock.Elapsed.TotalSeconds;
         if (sleepW > 0.5f) Say(Pick("Huh? Five more minutes...", "Wha-? I'm awake! I'm awake!"), true);
@@ -1037,6 +1176,7 @@ public class Monkey : Form
         UpdateSleep(now, dt);
         UpdateDance(now, dt);
         UpdateHabits(now, dt);
+        UpdatePerch(now);
         UpdateChat(now, dt);
 
         double ropeTarget = HandPose ? ArmLen : L, ropeRate = 7;
@@ -1044,13 +1184,19 @@ public class Monkey : Form
         {
             // Climb up its own tail, hang there a moment, then let go and drop.
             double cp = now - actStart;
-            if (cp < 1.3) ropeTarget = L - (L - 58) * cp / 1.3;
-            else if (cp < 1.9) ropeTarget = 58;
+            double top = perch == Perch.Up ? 30 : 58;   // climbs right up to the branch when it's going to sit
+            if (cp < ClimbTop) ropeTarget = L - (L - top) * cp / ClimbTop;
+            else if (cp < ClimbLetGo) ropeTarget = top;
             else ropeRate = 16;
         }
         rope += (ropeTarget - rope) * Ease(ropeRate, dt);
 
-        if (grabbed)
+        if (PerchedPose)
+        {
+            PointF hip = PerchHip();
+            x = hip.X; y = hip.Y; vx = vy = 0;
+        }
+        else if (grabbed)
         {
             Point c = ToLocal(Cursor.Position);
             if (Math.Abs(c.X - downAt.X) + Math.Abs(c.Y - downAt.Y) > 6) moved = true;
@@ -1084,6 +1230,7 @@ public class Monkey : Form
 
         UpdateBranchBend(dt);
         CheckFullscreen(now);
+        if (hideAt >= 0 && now >= hideAt) { hideAt = -1; hiddenByUser = true; ApplyVisibility(); SaveSettings(); }
         if (now >= nextTopCheck || (topAgainAt >= 0 && now >= topAgainAt))
         {
             KeepOnTop();
@@ -1092,9 +1239,12 @@ public class Monkey : Form
         }
 
         // The body follows the tail's angle with a little weight and wobble.
-        double target = Math.Atan2(x, y);
-        bodyAngVel += (140 * (target - bodyAngle) - 11 * bodyAngVel) * dt;
-        bodyAngle += bodyAngVel * dt;
+        if (!PerchedPose)
+        {
+            double target = Math.Atan2(x, y);
+            bodyAngVel += (140 * (target - bodyAngle) - 11 * bodyAngVel) * dt;
+            bodyAngle += bodyAngVel * dt;
+        }
 
         // Somersault when switching between hanging by the tail and by a hand.
         bool hp = HandPose;
@@ -1185,7 +1335,7 @@ public class Monkey : Form
         }
         else if (musicOn && soundSecs < 0.2) musicOn = false;
 
-        bool dance = musicOn && mode == Mode.Home && !grabbed && sleepW < 0.5f;
+        bool dance = musicOn && mode == Mode.Home && !grabbed && sleepW < 0.5f && !PerchedPose;
         danceW += ((dance ? 1 : 0) - danceW) * Ease(dance ? 4 : 3, dt);
 
         // A beat is a sudden jump in loudness; between clear beats it keeps its own groove.
@@ -1290,12 +1440,12 @@ public class Monkey : Form
 
     void UpdateHabits(double now, double dt)
     {
-        bool calm = mode == Mode.Home && !grabbed && sleepW < 0.05f && danceW < 0.05f;
+        bool calm = mode == Mode.Home && !grabbed && sleepW < 0.05f && danceW < 0.05f && !PerchedPose;
         if (act != Act.None && (now - actStart > actLen || !calm)) act = Act.None;
         actW += ((act == Act.None ? 0 : 1) - actW) * Ease(7, dt);
 
         // Health reminders: when it's home, awake and not busy with something else.
-        bool free = mode == Mode.Home && !grabbed && sleepW < 0.05f && act == Act.None && !hiddenForFullscreen;   // no nagging during a film
+        bool free = mode == Mode.Home && !grabbed && sleepW < 0.05f && act == Act.None && !Hidden && perch == Perch.None;   // no nagging during a film
         if (!healthReminders) { nextWater = Math.Max(nextWater, now + waterEvery); nextEyes = Math.Max(nextEyes, now + eyesEvery); }
         else if (free && now >= nextWater)
         {
@@ -1326,6 +1476,9 @@ public class Monkey : Form
             waveCooldown = now + 12;
             return;
         }
+
+        // Now and then it goes and sits on the branch for a while (not at night).
+        if (perch == Perch.None && now >= nextSit && !night) { StartSit(now); return; }
 
         // Otherwise, every so often, do something of its own.
         if ((nextAct -= dt) <= 0)
@@ -1388,14 +1541,15 @@ public class Monkey : Form
         g.Clear(Color.Transparent);
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
-        float hx = PX + (float)x, hy = PY + (float)y;
+        float hx = PX + (float)x, hy = PY + (float)y + (PerchedPose ? wrapDy : 0);   // sitting, it rides the branch
         double r = Math.Max(1, Math.Sqrt(x * x + y * y));
         float dx = (float)(x / r), dy = (float)(y / r);
 
 #if PROFILE
         double q0 = clock.Elapsed.TotalMilliseconds;
 #endif
-        if (!HandPose) TailCoil(g, false, TailWidth(r));   // the turns behind the branch
+        if (PerchedPose) DrawSitTail(g, hx, hy);              // hanging down behind the branch
+        else if (!HandPose) TailCoil(g, false, TailWidth(r));   // the turns behind the branch
         DrawBranch(g);
 #if PROFILE
         profBranch += clock.Elapsed.TotalMilliseconds - q0;
@@ -1403,10 +1557,10 @@ public class Monkey : Form
         chewing = biteOpen = false;
         if (peelFlying) DrawFlyingPeel(g);
         bool hand = HandPose;
-        if (hand) DrawArm(g, hx, hy); else DrawTail(g, hx, hy, dx, dy, r);
+        if (hand) DrawArm(g, hx, hy); else if (!PerchedPose) DrawTail(g, hx, hy, dx, dy, r);
         float headX = (hand ? -20 : 0) * mirror, headY = hand ? 2 : 70;
 
-        double tilt = bodyAngle + flip;
+        double tilt = PerchedPose ? -Math.PI * perchK : bodyAngle + flip;   // swinging up over the branch turns it head-up
         g.TranslateTransform(hx, hy);
         g.RotateTransform((float)(-tilt * 180 / Math.PI));
 
@@ -1415,6 +1569,7 @@ public class Monkey : Form
         double lx = cur.X - hx, ly = cur.Y - hy;
         double ca = Math.Cos(tilt), sa = Math.Sin(tilt);
         double ex = lx * ca - ly * sa - headX, ey = lx * sa + ly * ca - headY;
+        if (PerchedPose) { ex = cur.X - headWin.X; ey = cur.Y - headWin.Y; }   // its head stays upright up there
         double el = Math.Max(1, Math.Sqrt(ex * ex + ey * ey));
         float k = Ease(14, frameDt);
         lookX += ((float)(ex / el * Math.Min(2.6, el / 30)) * mirror - lookX) * k;
@@ -1446,7 +1601,13 @@ public class Monkey : Form
                 target = new PointF(PX + side * 11, PY + 1);          // both hands on the tab
                 want = 1;
             }
-            else if (mode == Mode.ToTab || mode == Mode.ToHome)
+            else if (mode == Mode.ToHome)
+            {
+                Point wp = WindowPos;
+                target = new PointF(freeHandAt.X - wp.X, freeHandAt.Y - wp.Y);   // letting go, reaching up, holding on
+                want = 1;
+            }
+            else if (mode == Mode.ToTab)
             {
                 Point wp = WindowPos;
                 target = new PointF(nextGrip.X - wp.X, nextGrip.Y - wp.Y);   // reach for the next grip
@@ -1464,7 +1625,7 @@ public class Monkey : Form
                 // Arms only stretch so far.
                 PointF sh = new PointF(-27, 24);
                 float ddx = pts[0].X - sh.X, ddy = pts[0].Y - sh.Y, len = (float)Math.Sqrt(ddx * ddx + ddy * ddy);
-                float maxReach = mode == Mode.AtTab || mode == Mode.PullDown ? 140 : 80;   // stretches to hold on with both hands
+                float maxReach = mode == Mode.AtTab || mode == Mode.PullDown ? 140 : mode == Mode.ToHome ? 125 : 80;   // stretches to hold on with both hands
                 if (len > maxReach) { ddx *= maxReach / len; ddy *= maxReach / len; }
                 freeLocal = new PointF(sh.X + ddx, sh.Y + ddy);
                 inv.Dispose();
@@ -1720,7 +1881,93 @@ public class Monkey : Form
 
     Bitmap branchCache;
     int branchFrame;
-    const int BranchW = 250, BranchH = 80, BranchOX = 125, BranchOY = 24;
+    const int BranchW = 250, BranchH = 80 + (int)PY, BranchOX = 125, BranchOY = 24 + (int)PY;
+
+    // Sitting on the branch now and then: it climbs its tail, swings up over the top of the branch,
+    // sits a while (legs dangling, hands on the wood), then swings back down and hangs again.
+    enum Perch { None, Up, Over, Sit, Down }
+    Perch perch;
+    double perchStart, sitUntil, nextSit = 40;
+    float perchK;            // 0 hanging .. 1 sitting: drives the swing over the top
+    PointF perchFrom;        // hips (relative to the branch) when the swing started
+    const double OverTime = 0.45;
+    bool PerchedPose { get { return perch == Perch.Over || perch == Perch.Sit || perch == Perch.Down; } }
+
+    void StartSit(double now)
+    {
+        perch = Perch.Up;
+        perchStart = now;
+        StartAct(Act.Climb, ClimbTop + 0.3, now);   // first, hand over hand up the tail
+    }
+
+    void UpdatePerch(double now)
+    {
+        if (perch == Perch.None) return;
+        if (mode != Mode.Home && PerchedPose) { LeavePerchNow(now); return; }   // off to a tab
+        bool leave = mode != Mode.Home || grabbed || musicOn || sleepW > 0.3f;
+        double el = now - perchStart;
+        switch (perch)
+        {
+            case Perch.Up:
+                if (leave || act != Act.Climb) { perch = Perch.None; break; }
+                if (el >= ClimbTop)
+                {
+                    perch = Perch.Over; perchStart = now;
+                    perchFrom = new PointF((float)x, (float)y);
+                    act = Act.None;
+                }
+                break;
+            case Perch.Over:
+                perchK = Smooth(el / OverTime);
+                if (el >= OverTime)
+                {
+                    perch = Perch.Sit; perchStart = now; perchK = 1;
+                    sitUntil = now + 15 + rnd.NextDouble() * 20;
+#if SITDEMO
+                    sitUntil = now + 4;
+#endif
+                    Say(Pick("Nice view from up here.", "Ahh, a seat!", "Time for a little sit.", "Comfy!"));
+                }
+                break;
+            case Perch.Sit:
+                if (leave || now >= sitUntil) { perch = Perch.Down; perchStart = now; perchFrom = new PointF(0, 36); }
+                break;
+            case Perch.Down:
+                perchK = 1 - Smooth(el / OverTime);
+                if (el >= OverTime) { LeavePerchNow(now); vy = 120; }   // drops into a hang and bounces
+                break;
+        }
+    }
+
+    // Back to hanging by the tail right under the branch.
+    void LeavePerchNow(double now)
+    {
+        perch = Perch.None; perchK = 0;
+        x = 0; y = 36; vx = vy = 0;
+        bodyAngle = bodyAngVel = 0;
+        nextSit = now + 60 + rnd.NextDouble() * 90;
+    }
+
+    // Where the hips are (relative to the branch) while swinging up over it or sitting on it.
+    PointF PerchHip()
+    {
+        double ang = Math.PI * perchK;
+        float r0 = (float)Math.Sqrt(perchFrom.X * perchFrom.X + perchFrom.Y * perchFrom.Y);
+        float r = r0 + (6 - r0) * perchK;
+        return new PointF(perchFrom.X * (1 - perchK) + 14 * (float)Math.Sin(ang), r * (float)Math.Cos(ang));
+    }
+
+    // Sitting, the tail hangs down behind the branch, swaying, with a curl at the end.
+    void DrawSitTail(Graphics g, float hx, float hy)
+    {
+        float sw = (float)Math.Sin(t * 1.5) * 6;
+        var p0 = new PointF(hx - 3, hy + 4);
+        var p1 = new PointF(hx - 10, hy + 40);
+        var p2 = new PointF(hx + 18 + sw, hy + 58);
+        var p3 = new PointF(hx + 8 + sw, hy + 80);
+        using (var o = RoundPen(Outline, 6f + 2 * OL)) { g.DrawBezier(o, p0, p1, p2, p3); g.DrawArc(o, p3.X - 12, p3.Y - 6, 12, 12, 0, 230); }
+        using (var f = RoundPen(Fur, 6f)) { g.DrawBezier(f, p0, p1, p2, p3); g.DrawArc(f, p3.X - 12, p3.Y - 6, 12, 12, 0, 230); }
+    }
 
     // The branch gives a little under the monkey: a hard tug on the tail (a fling, a drop, a big swing)
     // bends it down and it springs back with a wobble. bendPx is how far the wrap point has moved down.
@@ -1731,7 +1978,8 @@ public class Monkey : Form
     void UpdateBranchBend(double dt)
     {
         double target = 0;
-        if (mode == Mode.Home)
+        if (PerchedPose) target = 2.5 * perchK;   // its weight on the wood
+        else if (mode == Mode.Home)
         {
             // How much harder than usual the tail is pulling (at rest it stretches Gravity / Stiffness).
             double stretch = Math.Sqrt(x * x + y * y) - rope - Gravity / Stiffness;
@@ -1797,7 +2045,7 @@ public class Monkey : Form
         // Main branch: comes down from the top of the screen on the right (the tree is up there), thickest
         // where it enters, bends over and runs left, tapering to a thin tip with a slight droop.
         // It passes through (0, 0) where the tail wraps.
-        const int NH = 34, NB = 14;
+        const int NH = 34, NB = 22;
         var c = new PointF[NH + NB + 1];
         var hw = new float[c.Length];
         for (int i = 0; i <= NH; i++)
@@ -1806,18 +2054,20 @@ public class Monkey : Form
             c[i] = new PointF(x, BranchY(x));
             hw[i] = (2.2f + 8f * (float)Math.Pow(u, 1.25f)) / 2;
         }
-        PointF b0 = c[NH], b1 = new PointF(80, b0.Y - 0.5f), b2 = new PointF(97, -5), b3 = new PointF(99, -30);
+        PointF b0 = c[NH], b1 = new PointF(84, b0.Y - 0.5f), b2 = new PointF(99, -14), b3 = new PointF(104, -PY - 12);   // up past the top edge
         for (int i = 1; i <= NB; i++)
         {
             float s = i / (float)NB, a = 1 - s;
             c[NH + i] = new PointF(a * a * a * b0.X + 3 * a * a * s * b1.X + 3 * a * s * s * b2.X + s * s * s * b3.X,
                                    a * a * a * b0.Y + 3 * a * a * s * b1.Y + 3 * a * s * s * b2.Y + s * s * s * b3.Y);
-            hw[NH + i] = hw[NH] + (7.5f - hw[NH]) * s;   // flares out toward the trunk
+            hw[NH + i] = hw[NH] + (9f - hw[NH]) * (float)Math.Sqrt(s);   // flares out toward the trunk
         }
         int N = c.Length - 1;
         var top = new PointF[N + 1];
         var bottom = new PointF[N + 1];
         var ridgeLine = new PointF[N + 1];
+        var shadeLine = new PointF[N + 1];
+        var shadeW = new float[N + 1];
         for (int i = 0; i <= N; i++)
         {
             PointF p0 = c[Math.Max(0, i - 1)], p1 = c[Math.Min(N, i + 1)];
@@ -1827,6 +2077,8 @@ public class Monkey : Form
             top[i] = new PointF(bx + c[i].X - nx * w, by + c[i].Y - ny * w);
             bottom[N - i] = new PointF(bx + c[i].X + nx * w, by + c[i].Y + ny * w);
             ridgeLine[i] = new PointF(bx + c[i].X - nx * w * 0.5f, by + c[i].Y - ny * w * 0.5f);
+            shadeLine[i] = new PointF(bx + c[i].X + nx * w * 0.6f, by + c[i].Y + ny * w * 0.6f);
+            shadeW[i] = w;
         }
         using (var path = new GraphicsPath())
         {
@@ -1834,8 +2086,15 @@ public class Monkey : Form
             path.AddCurve(bottom, 0.4f);
             path.CloseFigure();
             using (var o = new Pen(Outline, 3.2f) { LineJoin = LineJoin.Round }) g.DrawPath(o, path);
-            using (var lg = new LinearGradientBrush(new RectangleF(bx - 100, by - 9, 214, 18), Light(bark, 0.28f), Dark(bark, 0.28f), LinearGradientMode.Vertical))
-                g.FillPath(lg, path);
+            // Plain bark, lit along the upper side and shaded underneath (works along the bend and up the stem too).
+            using (var b = new SolidBrush(bark)) g.FillPath(b, path);
+            var shadeClip = g.Clip;
+            g.SetClip(path, CombineMode.Intersect);
+            for (int i = 0; i < N; i++)
+                using (var sh = RoundPen(Color.FromArgb(90, 50, 28, 12), shadeW[i] * 0.9f)) g.DrawLine(sh, shadeLine[i], shadeLine[i + 1]);
+            for (int i = 0; i < N; i++)
+                using (var lt = RoundPen(Color.FromArgb(55, 255, 225, 180), shadeW[i] * 0.6f)) g.DrawLine(lt, ridgeLine[i], ridgeLine[i + 1]);
+            g.Clip = shadeClip;
 
             // Bark: thin grooves running along the wood, and a lit ridge along the upper side.
             var clip = g.Clip;
@@ -1998,6 +2257,7 @@ public class Monkey : Form
         var c1 = new PointF(start.X + 8, start.Y + 24);
         var c2 = new PointF(hx - dx * 40 - dy * 14, hy - dy * 40 + dx * 14);
         var end = new PointF(hx, hy);
+        tailBez[0] = start; tailBez[1] = c1; tailBez[2] = c2; tailBez[3] = end;   // the hands climb along it
         using (var o = RoundPen(Outline, w + 2 * OL)) g.DrawBezier(o, start, c1, c2, end);
         using (var f = RoundPen(Fur, w)) g.DrawBezier(f, start, c1, c2, end);
         TailCoil(g, true, w);   // the turns across the front of the branch
@@ -2027,6 +2287,7 @@ public class Monkey : Form
         Act shown = ShownAct;
         float kickAmp = 2f + (shown == Act.Pump ? 6f * actW : 0);
         float kick = (float)Math.Sin(2 * Math.PI * t / SwayPeriod + 1.2) * kickAmp;
+        kick += ((float)Math.Sin(t * 2.1) * 6 - kick) * perchK;   // sitting, its legs dangle and swing
         float beatSide = beatCount % 2 == 0 ? 1 : -1;
         kick += ((float)Math.Sin(beatPhase * Math.PI) * 9 * beatSide - kick) * danceW;   // kick to the beat
 
@@ -2048,9 +2309,12 @@ public class Monkey : Form
         // A pocket on the hip, with its snack sticking out (until it's taken out to eat).
         bool bananaTaken = shown == Act.Eat && actW > 0.05f && clock.Elapsed.TotalSeconds - actStart >= GrabTime;
         // It snacks all day, so the pocket is stuffed with a bunch; it pulls the middle one out to eat.
-        DrawBanana(g, new PointF(PocketGrip.X - 5.5f, PocketGrip.Y + 2), 165, PocketScale * 0.95f, 0, 1, false);
-        DrawBanana(g, new PointF(PocketGrip.X + 5.5f, PocketGrip.Y + 1.5f), 197, PocketScale * 0.95f, 0, 1, false);
-        if (!bananaTaken) DrawBanana(g, PocketGrip, 180, PocketScale, 0, 1, false);
+        if (perchK < 0.5f)   // sitting, the jacket's upside down, so they're tucked right in
+        {
+            DrawBanana(g, new PointF(PocketGrip.X - 5.5f, PocketGrip.Y + 2), 165, PocketScale * 0.95f, 0, 1, false);
+            DrawBanana(g, new PointF(PocketGrip.X + 5.5f, PocketGrip.Y + 1.5f), 197, PocketScale * 0.95f, 0, 1, false);
+            if (!bananaTaken) DrawBanana(g, PocketGrip, 180, PocketScale, 0, 1, false);
+        }
         DrawPocket(g, !bananaTaken);
 
         // Arms in puffer sleeves: dangling below the head, unless it is busy with a habit.
@@ -2059,10 +2323,19 @@ public class Monkey : Form
         double ap = clock.Elapsed.TotalSeconds - actStart;
         if (shown == Act.Scratch)
             tR = new PointF(23, 54 + (float)Math.Sin(t * 22) * 3);                      // scratching its head
-        else if (shown == Act.Climb && ap < 1.5)
+        bool climbing = shown == Act.Climb && ap < ClimbLetGo + 0.4;
+        bool gripL = false, gripR = false;
+        float angL = 0, angR = 0;
+        if (climbing)
         {
-            float c = (float)Math.Sin(t * 9) * 6;                                     // hand over hand up the tail
-            tL = new PointF(-9, 6 + c); tR = new PointF(9, 6 - c);
+            // Hand over hand up its own tail (found in body coordinates from where the tail was drawn).
+            var inv = g.Transform.Clone();
+            inv.Invert();
+            var bz = (PointF[])tailBez.Clone();
+            inv.TransformPoints(bz);
+            inv.Dispose();
+            tL = ClimbHand(bz, ap, 0f, -1, restL, out gripL, out angL);
+            tR = ClimbHand(bz, ap, 0.5f, 1, restR, out gripR, out angR);
         }
         else if (shown == Act.Wave)
         {
@@ -2093,6 +2366,12 @@ public class Monkey : Form
         }
         PointF hL = Lerp(restL, tL, actW), hR = Lerp(restR, tR, actW);
         if (shown == Act.Eat && ap >= GrabTime && ap < TossTime && actW > 0.9f) hR = tR;   // the banana stays in its hand
+        if (climbing && actW > 0.9f) { hL = tL; hR = tR; }                                  // hands stay on the tail
+        if (perchK > 0.01f)                                                                 // sitting: hands on the branch beside it
+        {
+            hL = Lerp(hL, new PointF(-24, -1), perchK);
+            hR = Lerp(hR, new PointF(24, -1), perchK);
+        }
         // The free hand peels the banana: it pinches the end of the strip being peeled and pulls it down.
         bool peelingNow = shown == Act.Eat && actW > 0.5f && ap > PeelStart - 0.35 && ap < PeelStart + 3 * PeelSlot + 0.1;
         peelW += ((peelingNow ? 1 : 0) - peelW) * Ease(9, frameDt);
@@ -2124,11 +2403,27 @@ public class Monkey : Form
             SleevedArm(g, new PointF(16, 30), new PointF(36, 44), new PointF(hR.X + 16, hR.Y - 14), hR);   // arm behind the head
         else if (!scratchInFront)
             ArmTo(g, new PointF(16, 30), hR, 1);
+        if (climbing && actW > 0.5f)
+        {
+            // Fingers wrapped round the tail where a hand is holding on.
+            if (gripL) Grip(g, hL, angL);
+            if (gripR) Grip(g, hR, angR);
+        }
 
 #if PROFILE
         double qh = profClock.Elapsed.TotalMilliseconds;
 #endif
-        DrawHead(g, 0, 70 + danceW * 3f * (float)Math.Sin(beatPhase * Math.PI));   // nod to the beat
+        float headCY = 70 + danceW * 3f * (float)Math.Sin(beatPhase * Math.PI);   // nod to the beat
+        var headState = g.Save();
+        if (perchK > 0)
+        {
+            // The body turns over to sit, but the head stays upright.
+            g.TranslateTransform(0, headCY);
+            g.RotateTransform(-180 * perchK);
+            g.TranslateTransform(0, -headCY);
+        }
+        DrawHead(g, 0, headCY);
+        g.Restore(headState);
 #if PROFILE
         profHead += profClock.Elapsed.TotalMilliseconds - qh;
 #endif
@@ -2314,6 +2609,57 @@ public class Monkey : Form
         // The opening gapes around the bananas, stretched by the bunch.
         using (var gap = RoundPen(Color.FromArgb(160, 15, 35, 35), 1.6f))
             g.DrawArc(gap, r.Left + 2, r.Top - 0.5f, r.Width - 4, 4, 0, 180);
+    }
+
+    // Climbing its tail (see the Climb habit's timing in Frame): pulls itself up until ClimbTop, hangs, lets go at ClimbLetGo.
+    const double ClimbTop = 1.3, ClimbLetGo = 1.9, ClimbRate = 1.8;   // hand-over-hand cycles per second, per hand
+    PointF[] tailBez = new PointF[4];   // the tail as last drawn (window coordinates), branch end first
+
+    static PointF Bez(PointF[] b, float t)
+    {
+        float a = 1 - t;
+        return new PointF(a * a * a * b[0].X + 3 * a * a * t * b[1].X + 3 * a * t * t * b[2].X + t * t * t * b[3].X,
+                          a * a * a * b[0].Y + 3 * a * a * t * b[1].Y + 3 * a * t * t * b[2].Y + t * t * t * b[3].Y);
+    }
+
+    // Where one hand is on the tail. Each hand grips high and pulls down while the body rises, then lets go,
+    // swings a little out to the side and reaches up past the other hand to grip high again ('offset' keeps
+    // the two hands half a cycle apart). At the top both hold on; then they let go and drop back to 'rest'.
+    static PointF ClimbHand(PointF[] bz, double ap, float offset, int side, PointF rest, out bool grip, out float angle)
+    {
+        float len = (float)Math.Sqrt(Math.Pow(bz[0].X - bz[3].X, 2) + Math.Pow(bz[0].Y - bz[3].Y, 2));
+        float tHi = Math.Max(0.3f, 1 - 40 / len), tLo = Math.Max(0.35f, 1 - 10 / len);
+        float tt, outward = 0;
+        double ph = (Math.Min(ap, ClimbTop) * ClimbRate + offset) % 1.0;
+        grip = true;
+        if (ap >= ClimbTop) tt = offset == 0 ? tHi : (tHi + tLo) / 2;   // hanging at the top: one hand above the other
+        else if (ph < 0.55) tt = tHi + (tLo - tHi) * (float)(ph / 0.55);  // holding on and pulling down
+        else
+        {
+            float u = (float)((ph - 0.55) / 0.45);                          // reaching up for the next grip
+            tt = tLo + (tHi - tLo) * Smooth(u);
+            outward = side * 8 * (float)Math.Sin(Math.PI * u);
+            grip = false;
+        }
+        PointF p = Bez(bz, tt), q = Bez(bz, Math.Max(0, tt - 0.05f));
+        angle = (float)(Math.Atan2(q.X - p.X, -(q.Y - p.Y)) * 180 / Math.PI);   // fist turned along the tail
+        p = new PointF(p.X + outward, p.Y);
+        if (ap >= ClimbLetGo)
+        {
+            grip = false;
+            return Lerp(p, rest, Smooth((ap - ClimbLetGo) / 0.35));   // let go and drop
+        }
+        return p;
+    }
+
+    // Fingers curled round something running along 'angle' (the tail) at 'hand'.
+    static void Grip(Graphics g, PointF hand, float angle)
+    {
+        var st = g.Save();
+        g.TranslateTransform(hand.X, hand.Y);
+        g.RotateTransform(angle);
+        FistFront(g);
+        g.Restore(st);
     }
 
     // A fist holding something upright at (0, 0), drawn in two parts: the palm behind it...
