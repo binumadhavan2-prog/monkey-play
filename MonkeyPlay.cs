@@ -42,6 +42,10 @@ public class Monkey : Form
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(PT pt, uint flags);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
@@ -265,6 +269,7 @@ public class Monkey : Form
                 else if (key == "hideInFullscreen" && bool.TryParse(val, out b)) hideInFullscreen = b;
                 else if (key == "hiddenByUser" && bool.TryParse(val, out b)) hiddenByUser = b;
                 else if (key == "blastTabs" && bool.TryParse(val, out b)) blastTabs = b;
+                else if (key == "screen") homeScreen = val;
                 else if (key == "waterMinutes" && int.TryParse(val, out n) && n > 0) waterEvery = n * 60;
                 else if (key == "eyesMinutes" && int.TryParse(val, out n) && n > 0) eyesEvery = n * 60;
             }
@@ -283,6 +288,7 @@ public class Monkey : Form
                 "hideInFullscreen=" + hideInFullscreen,
                 "hiddenByUser=" + hiddenByUser,
                 "blastTabs=" + blastTabs,
+                "screen=" + homeScreen,
                 "waterMinutes=" + (int)(waterEvery / 60),
                 "eyesMinutes=" + (int)(eyesEvery / 60),
             });
@@ -525,7 +531,7 @@ public class Monkey : Form
     }
 
 #if PROFILE
-    double profDraw, profPush, profBranch, profBody; int profFrames;
+    double profDraw, profPush, profBranch, profBody, profCoil, profCompose, profBlit; int profFrames;
     static double profHead, profJacket;
     static Stopwatch profClock = Stopwatch.StartNew();
 #endif
@@ -543,6 +549,7 @@ public class Monkey : Form
     readonly object tabLock = new object();
     Dictionary<IntPtr, List<RectangleF>> browserTabs = new Dictionary<IntPtr, List<RectangleF>>();
     Dictionary<IntPtr, RectangleF> selectedTabs = new Dictionary<IntPtr, RectangleF>();   // the open tab of each window
+    volatile bool browserInFront = true;
 
     // Chrome/Edge tabs overlap their neighbours by about 18px at each end, and draw the close (x) about
     // 28px in from the right edge. Narrow tabs only show the x on the open tab.
@@ -587,6 +594,9 @@ public class Monkey : Form
         using (showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "HangingMonkey_Show"))
         {
             if (!created) { showSignal.Set(); return; }   // already running: tell it to come out instead
+            // Work in real screen pixels on every screen (mouse, tabs, windows all agree), and draw at each screen's scale.
+            try { if (!SetProcessDpiAwarenessContext(new IntPtr(-4) /* PER_MONITOR_AWARE_V2 */)) SetProcessDPIAware(); }
+            catch { try { SetProcessDPIAware(); } catch { } }
             Application.EnableVisualStyles();
             Application.Run(new Monkey());
         }
@@ -610,12 +620,9 @@ public class Monkey : Form
         ShowInTaskbar = false;
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
-        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-        // Branch 230px from the right edge, clear of the window buttons; the window may extend past the screen edge.
-        home = anchor = new PointF(wa.Right - 230, wa.Top + PY);
-        Bounds = new Rectangle((int)(anchor.X - PX), (int)(anchor.Y - PY), W, H);
-
         LoadSettings();
+        PlaceOnScreen();
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged += (s, e) => BeginInvoke((Action)(() => PlaceOnScreen()));
         nextWater = waterEvery; nextEyes = eyesEvery;
 #if DRINKDEMO
         nextWater = 1;   // test build: water break right away
@@ -643,6 +650,10 @@ public class Monkey : Form
         var fullItem = new ToolStripMenuItem("Hide during fullscreen") { Checked = hideInFullscreen, CheckOnClick = true };
         fullItem.CheckedChanged += (s, e) => { hideInFullscreen = fullItem.Checked; SaveSettings(); nextFullCheck = 0; };
         menu.Items.Add(fullItem);
+        var screenMenu = new ToolStripMenuItem("Live on screen");
+        screenMenu.DropDownOpening += (s, e) => FillScreenMenu(screenMenu);
+        screenMenu.DropDownItems.Add("...");   // filled when opened (screens can come and go)
+        menu.Items.Add(screenMenu);
         var blastItem = new ToolStripMenuItem("Monkey blasts closed tabs") { Checked = blastTabs, CheckOnClick = true };
         blastItem.CheckedChanged += (s, e) => { blastTabs = blastItem.Checked; SaveSettings(); };
         menu.Items.Add(blastItem);
@@ -728,16 +739,19 @@ public class Monkey : Form
 
         while (true)
         {
-            Thread.Sleep(120);
+            // Often while a browser is in front (its tabs can move), now and then otherwise.
+            Thread.Sleep(Hidden ? 1000 : browserInFront ? 120 : 500);
             try
             {
                 if ((DateTime.Now - namesReset).TotalSeconds > 30) { names.Clear(); namesReset = DateTime.Now; }
                 IntPtr fg = GetForegroundWindow();
+                bool anyFront = false;
                 var fresh = new Dictionary<IntPtr, List<RectangleF>>();
                 var selected = new Dictionary<IntPtr, RectangleF>();
 
                 foreach (IntPtr win in BrowserWindows(names))
                 {
+                    if (win == fg) anyFront = true;
                     AutomationElement strip;
                     if (!strips.TryGetValue(win, out strip))
                     {
@@ -787,6 +801,7 @@ public class Monkey : Form
                 }
 
                 lock (tabLock) { browserTabs = fresh; selectedTabs = selected; }
+                browserInFront = anyFront;
                 // Forget closed windows.
                 foreach (var gone in new List<IntPtr>(strips.Keys)) if (!fresh.ContainsKey(gone)) strips.Remove(gone);
             }
@@ -796,7 +811,7 @@ public class Monkey : Form
 
     void GoToTab(PointF tab)
     {
-        if (!Screen.PrimaryScreen.Bounds.Contains(Point.Round(tab))) return;
+        if (!SystemInformation.VirtualScreen.Contains(Point.Round(tab))) return;
         if (mode == Mode.PullDown) return;
         // Already there (this is the tab it just pulled open).
         if ((mode == Mode.ToTab || mode == Mode.AtTab) && Math.Abs(tab.X - travelTo.X) < 30) return;
@@ -903,7 +918,7 @@ public class Monkey : Form
             using (var g = Graphics.FromImage(tabShot)) g.CopyFromScreen((int)tab.X, (int)tab.Y, 0, 0, tabShot.Size);
         }
         catch { tabShot = null; }
-        float hx = anchor.X + (float)x, hy = anchor.Y + (float)y;
+        float hx = anchor.X + (float)x * S, hy = anchor.Y + (float)y * S;
         float ddx = blastAt.X - hx, ddy = blastAt.Y - hy, len = Math.Max(1, (float)Math.Sqrt(ddx * ddx + ddy * ddy));
         throwDir = new PointF(ddx / len, ddy / len);
         handScreen = new PointF(hx, hy);
@@ -921,7 +936,7 @@ public class Monkey : Form
         {
             // Let go of the banana: it flies from the hand to the tab.
             blastFrom = handScreen;
-            Rectangle scr = Screen.PrimaryScreen.Bounds;
+            Rectangle scr = Screen.FromPoint(Point.Round(blastAt)).Bounds;
             int left = (int)Math.Min(blastFrom.X, blastAt.X) - 170, right = (int)Math.Max(blastFrom.X, blastAt.X) + 170;
             int top = Math.Max(scr.Top, (int)Math.Min(blastFrom.Y, blastAt.Y) - 200), bottom = (int)Math.Max(blastFrom.Y, blastAt.Y) + 230;
             fxArea = Rectangle.FromLTRB(left, top, right, bottom);
@@ -1263,7 +1278,7 @@ public class Monkey : Form
                 (float)(travelFrom.Y + (travelTo.Y - travelFrom.Y) * stepFrac[seg]) + stepDip[seg]);
             // Keep the reaching hand on screen; near the top edge a leap goes into the body swing instead.
             float baseY = (float)(travelFrom.Y + (travelTo.Y - travelFrom.Y) * e) + dip;
-            lift = Math.Min(lift, Math.Max(0, baseY - (Screen.PrimaryScreen.Bounds.Top + 8)));
+            lift = Math.Min(lift, Math.Max(0, baseY - (Screen.FromPoint(Point.Round(new PointF(anchor.X, baseY))).Bounds.Top + 8)));
             if (seg != lastStep)
             {
                 lastStep = seg;
@@ -1335,7 +1350,7 @@ public class Monkey : Form
         {
             RECT r;
             GetWindowRect(pendingWindow, out r);
-            Rectangle scr = Screen.PrimaryScreen.Bounds;
+            Rectangle scr = Screen.FromHandle(pendingWindow).Bounds;
             int top = (int)Math.Ceiling(pendingTab.Bottom);
             area = Rectangle.FromLTRB(Math.Max(r.L, scr.Left), top, Math.Min(r.R, scr.Right), Math.Min(r.B, scr.Bottom));
             if (area.Width < 50 || area.Height < 50) throw new Exception("window too small");
@@ -1389,7 +1404,7 @@ public class Monkey : Form
     void MoveAnchor(PointF a, bool lagBehind)
     {
         // The body keeps its place on screen and swings to catch up.
-        if (!grabbed && lagBehind) { x -= a.X - anchor.X; y -= a.Y - anchor.Y; }
+        if (!grabbed && lagBehind) { x -= (a.X - anchor.X) / S; y -= (a.Y - anchor.Y) / S; }
         anchor = a;
     }
 
@@ -1464,12 +1479,12 @@ public class Monkey : Form
         if (e.Button != MouseButtons.Left) return;
         if (PerchedPose || perch == Perch.Up) LeavePerchNow(clock.Elapsed.TotalSeconds);   // pulled off its seat
         grabbed = true; moved = false;
-        downAt = e.Location; downTime = clock.Elapsed.TotalSeconds;
+        downAt = new Point((int)(e.X / S), (int)(e.Y / S)); downTime = clock.Elapsed.TotalSeconds;
         if (sleepW > 0.5f) Say(Pick("Huh? Five more minutes...", "Wha-? I'm awake! I'm awake!"), true);
         else Say(Pick("Whoa!", "Hey!", "Eep!", "Where are we going?"), true);
         // Keep the spot you touched under your finger (no jump).
-        grabDx = (e.X - PX) - x;
-        grabDy = (e.Y - PY) - y;
+        grabDx = (e.X / S - PX) - x;
+        grabDy = (e.Y / S - PY) - y;
         vx = vy = 0;
     }
 
@@ -1480,7 +1495,7 @@ public class Monkey : Form
         if (!moved && clock.Elapsed.TotalSeconds - downTime < 0.35)
         {
             // Tap: bump it away from where it was touched.
-            vx += (e.X - PX < x ? 1 : -1) * 450;
+            vx += (e.X / S - PX < x ? 1 : -1) * 450;
             vy -= 120;
             grinTime = 1.0;
             Say(Pick("Hehe!", "That tickles!", "Again! Again!", "Boop!"), true);
@@ -1503,7 +1518,7 @@ public class Monkey : Form
         {
             double start = clock.Elapsed.TotalSeconds;
             Frame();
-            double interval = Hidden ? 0.2 : onBattery ? 1 / 30.0 : 1 / 60.0;
+            double interval = Hidden ? 0.2 : onBattery || Calm ? 1 / 30.0 : 1 / 60.0;
             if (Hidden)
             {
                 // Sleep, but wake straight away for clicks, the menu or hold-M.
@@ -1518,6 +1533,18 @@ public class Monkey : Form
 
     bool onBattery;
     double nextPowerCheck;
+
+    // Nothing fast going on (just a gentle sway, sitting, or a calm habit): 30 frames a second looks the same.
+    bool Calm
+    {
+        get
+        {
+            return mode == Mode.Home && !grabbed && blastPhase == 0 && danceW < 0.05f
+                && act != Act.Climb && act != Act.Pump && act != Act.Throw
+                && (perch == Perch.None || perch == Perch.Sit)
+                && Math.Abs(vx) + Math.Abs(vy) < 160 && Math.Abs(bodyAngVel) < 1.5 && Math.Abs(flipVel) < 1 && Math.Abs(bendVel) < 20;
+        }
+    }
 
     void CheckPower(double now)
     {
@@ -1719,8 +1746,8 @@ public class Monkey : Form
                 if (beatCount % 2 == 0)
                 {
                     float side = rnd.Next(2) == 0 ? -1 : 1;
-                    float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle));
-                    float hy = anchor.Y + (float)(y + 70 * Math.Cos(bodyAngle));
+                    float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle)) * S;
+                    float hy = anchor.Y + (float)(y + 70 * Math.Cos(bodyAngle)) * S;
                     zzz.Add(new Zz
                     {
                         p = new PointF(hx + side * 26, hy - 8), drift = side * (10 + (float)rnd.NextDouble() * 12),
@@ -1757,8 +1784,8 @@ public class Monkey : Form
         // Little Zs float up beside its head while it sleeps.
         if (sleepW > 0.8f && now >= nextZ)
         {
-            float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle));
-            float hy = anchor.Y + (float)(y + 70 * Math.Cos(bodyAngle));
+            float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle)) * S;
+            float hy = anchor.Y + (float)(y + 70 * Math.Cos(bodyAngle)) * S;
             zzz.Add(new Zz { p = new PointF(hx + 20, hy - 12), drift = 14 + (float)rnd.NextDouble() * 10 });
             nextZ = now + 1.1 + rnd.NextDouble() * 0.5;
         }
@@ -1786,7 +1813,8 @@ public class Monkey : Form
                 Color fill = z.note ? z.col : Color.FromArgb(255, 235, 240, 255);
                 using (var path = new GraphicsPath())
                 {
-                    path.AddString(z.ch, z.note ? symbols : family, (int)FontStyle.Bold, size, new PointF(z.p.X - wp.X, z.p.Y - wp.Y - size), fmt);
+                    PointF zl = ToLocalF(z.p);
+                    path.AddString(z.ch, z.note ? symbols : family, (int)FontStyle.Bold, size, new PointF(zl.X, zl.Y - size), fmt);
                     using (var o = new Pen(Color.FromArgb((int)(200 * fade), 30, 40, 90), 2.4f) { LineJoin = LineJoin.Round }) g.DrawPath(o, path);
                     using (var f = new SolidBrush(Color.FromArgb((int)(255 * fade), fill))) g.FillPath(f, path);
                 }
@@ -1828,8 +1856,8 @@ public class Monkey : Form
         if (!calm || act != Act.None) return;
 
         // Wave when your cursor comes close to its face.
-        float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle));
-        float hy = anchor.Y + (float)(y + 70 * Math.Cos(bodyAngle));
+        float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle)) * S;
+        float hy = anchor.Y + (float)(y + 70 * Math.Cos(bodyAngle)) * S;
         Point c = Cursor.Position;
         if (now > waveCooldown && Math.Abs(c.X - hx) + Math.Abs(c.Y - hy) < 190)
         {
@@ -1866,9 +1894,64 @@ public class Monkey : Form
         }
     }
 
-    Point WindowPos { get { return new Point((int)Math.Round(anchor.X - PX), (int)Math.Round(anchor.Y - PY)); } }
+    // The monkey is drawn in its own units (window coordinates below are in these), scaled by S to the
+    // screen it lives on: 1 at 100% scaling, 1.25 at 125%, and so on. Screen positions are real pixels.
+    float S = 1;
+    Matrix baseM = new Matrix();
+    string homeScreen = "";   // device name of the screen it lives on ("" = the main screen)
 
-    Point ToLocal(Point screen) { Point w = WindowPos; return new Point(screen.X - w.X, screen.Y - w.Y); }
+    Point WindowPos { get { return new Point((int)Math.Round(anchor.X - PX * S), (int)Math.Round(anchor.Y - PY * S)); } }
+
+    Point ToLocal(Point screen) { Point w = WindowPos; return new Point((int)Math.Round((screen.X - w.X) / S), (int)Math.Round((screen.Y - w.Y) / S)); }
+    PointF ToLocalF(PointF screen) { Point w = WindowPos; return new PointF((screen.X - w.X) / S, (screen.Y - w.Y) / S); }
+
+    Screen HomeScreen()
+    {
+        foreach (var sc in Screen.AllScreens) if (sc.DeviceName == homeScreen) return sc;
+        return Screen.PrimaryScreen;   // not chosen, or that screen is unplugged
+    }
+
+    static float ScaleAt(Point pt)
+    {
+        try
+        {
+            uint dx, dy;
+            IntPtr mon = MonitorFromPoint(new PT(pt.X, pt.Y), 2 /* NEAREST */);
+            if (GetDpiForMonitor(mon, 0 /* EFFECTIVE */, out dx, out dy) == 0 && dx > 0) return dx / 96f;
+        }
+        catch { }
+        return 1;
+    }
+
+    // Put the branch near the top-right of its screen (clear of the window buttons), at that screen's scale.
+    void PlaceOnScreen()
+    {
+        Rectangle wa = HomeScreen().WorkingArea;
+        S = ScaleAt(new Point(wa.Left + wa.Width / 2, wa.Top + wa.Height / 2));
+        baseM.Dispose();
+        baseM = new Matrix();
+        baseM.Scale(S, S);
+        canvas = null;   // redrawn at the new size
+        PointF was = home;
+        home = new PointF(wa.Right - 230 * S, wa.Top + PY * S);
+        if (mode == Mode.Home || was == PointF.Empty) anchor = home;   // away on a tab trip, it climbs back to the new spot
+        Bounds = new Rectangle(WindowPos, new Size((int)Math.Ceiling(W * S), (int)Math.Ceiling(H * S)));
+    }
+
+    void FillScreenMenu(ToolStripMenuItem parent)
+    {
+        parent.DropDownItems.Clear();
+        Screen current = HomeScreen();
+        int n = 1;
+        foreach (var sc in Screen.AllScreens)
+        {
+            var it = new ToolStripMenuItem("Screen " + n++ + (sc.Primary ? " (main)" : "") + "  " + sc.Bounds.Width + "\u00d7" + sc.Bounds.Height)
+                { Checked = sc.DeviceName == current.DeviceName };
+            Screen pick = sc;
+            it.Click += (s, e) => { homeScreen = pick.Primary ? "" : pick.DeviceName; SaveSettings(); PlaceOnScreen(); };
+            parent.DropDownItems.Add(it);
+        }
+    }
 
     void KeepInside(ref double nx, ref double ny)
     {
@@ -1899,9 +1982,9 @@ public class Monkey : Form
 #if PROFILE
         double profStart = clock.Elapsed.TotalMilliseconds;
 #endif
-        if (canvas == null) canvas = new Canvas(W, H);
+        if (canvas == null) canvas = new Canvas((int)Math.Ceiling(W * S), (int)Math.Ceiling(H * S));
         Graphics g = canvas.G;
-        g.ResetTransform();
+        g.Transform = baseM;   // back to window coordinates, at the screen's scale
         g.Clear(Color.Transparent);
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
@@ -1914,6 +1997,9 @@ public class Monkey : Form
 #endif
         if (PerchedPose) DrawSitTail(g, hx, hy);              // hanging down behind the branch
         else if (!HandPose) TailCoil(g, false, TailWidth(r));   // the turns behind the branch
+#if PROFILE
+        profCoil += clock.Elapsed.TotalMilliseconds - q0;
+#endif
         DrawBranch(g);
 #if PROFILE
         profBranch += clock.Elapsed.TotalMilliseconds - q0;
@@ -1948,7 +2034,7 @@ public class Monkey : Form
         float stretch = Math.Min(0.07f, speed / 14000f);
         var headPt = new[] { new PointF(headX, headY) };
         g.Transform.TransformPoints(headPt);
-        headWin = headPt[0];
+        headWin = new PointF(headPt[0].X / S, headPt[0].Y / S);   // in its own units
         g.ScaleTransform((hand ? mirror : 1) * (1 - stretch * 0.6f), 1 + stretch);
 
 #if PROFILE
@@ -1962,7 +2048,7 @@ public class Monkey : Form
             float side = -mirror;   // the free shoulder's side, on screen
             if (mode == Mode.AtTab || mode == Mode.PullDown)
             {
-                target = new PointF(PX + side * 11, PY + 1);          // both hands on the tab
+                target = new PointF((PX + side * 11) * S, (PY + 1) * S);   // both hands on the tab (canvas pixels, like the others)
                 want = 1;
             }
             else if (mode == Mode.ToHome)
@@ -1997,7 +2083,7 @@ public class Monkey : Form
             DrawBodyByHand(g);
         }
         else DrawBody(g);
-        g.ResetTransform();
+        g.Transform = baseM;   // back to window coordinates, at the screen's scale
         DrawZzz(g);
         DrawBubble(g);
 #if PROFILE
@@ -2011,10 +2097,15 @@ public class Monkey : Form
         canvas.Push(Handle, WindowPos);
 #if PROFILE
         profPush += clock.Elapsed.TotalMilliseconds - pushStart;
-        if (++profFrames == 300)
+        if (++profFrames == 300)   // every 300 frames, the averages for those frames
+        {
             System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_prof.txt"),
-                string.Format("draw {0:F2} ms (branch {2:F2}, body {3:F2}, head {4:F2}, jacket {5:F2}), push {1:F2} ms per frame",
-                    profDraw / 300, profPush / 300, profBranch / 300, profBody / 300, profHead / 300, profJacket / 300));
+                string.Format("draw {0:F2} ms (branch {2:F2} [coil {6:F2}, leaves {7:F2}, blit {8:F2}], body {3:F2}, head {4:F2}, jacket {5:F2}), push {1:F2} ms per frame",
+                    profDraw / 300, profPush / 300, profBranch / 300, profBody / 300, profHead / 300, profJacket / 300,
+                    profCoil / 300, profCompose / 300, profBlit / 300));
+            profFrames = 0;
+            profDraw = profPush = profBranch = profBody = profHead = profJacket = profCoil = profCompose = profBlit = 0;
+        }
 #endif
     }
 
@@ -2243,7 +2334,8 @@ public class Monkey : Form
 
     // ---- Scenery ----
 
-    Bitmap branchCache;
+    Bitmap branchCache, woodCache;
+    float composedBend = float.NaN;   // the bend the branch picture was last drawn with
     int branchFrame;
     const int BranchW = 250, BranchH = 80 + (int)PY, BranchOX = 125, BranchOY = 24 + (int)PY;
 
@@ -2363,24 +2455,49 @@ public class Monkey : Form
     {
         if (branchAlpha < 0.02f) return;
         // The leaves sway slowly, so the branch only needs redrawing every few frames.
+        // The wood never changes, so it's painted once; only the leaves (behind and in front of it) are redone.
+        if (woodCache == null)
+        {
+            woodCache = new Bitmap(BranchW, BranchH, PixelFormat.Format32bppPArgb);
+            using (var wg = Graphics.FromImage(woodCache))
+            {
+                wg.SmoothingMode = SmoothingMode.AntiAlias;
+                PaintBranch(wg, BranchOX, BranchOY, 1);
+            }
+        }
         if (branchCache == null) branchCache = new Bitmap(BranchW, BranchH, PixelFormat.Format32bppPArgb);
-        if (branchFrame++ % 4 == 0)
+#if PROFILE
+        double qc = clock.Elapsed.TotalMilliseconds;
+#endif
+        // Redone every few frames for the swaying leaves, or as soon as the bend visibly changes. Turning the
+        // picture is slow, so it's turned here (already bent) and simply copied on the other frames.
+        if (branchFrame++ % 6 == 0 || Math.Abs(bendPx - composedBend) > 0.15)
             using (var bg = Graphics.FromImage(branchCache))
             {
                 bg.SmoothingMode = SmoothingMode.AntiAlias;
                 bg.Clear(Color.Transparent);
-                PaintBranch(bg, BranchOX, BranchOY);
+                if (Math.Abs(bendPx) > 0.05)   // bend by turning it a touch around where it joins the tree
+                {
+                    float px = BranchOX + PivotX, py = BranchOY + PivotY;
+                    bg.TranslateTransform(px, py);
+                    bg.RotateTransform((float)(Math.Atan2(-bendPx, PivotX) * 180 / Math.PI));
+                    bg.TranslateTransform(-px, -py);
+                }
+                PaintBranch(bg, BranchOX, BranchOY, 0);
+                bg.DrawImage(woodCache, 0, 0, BranchW, BranchH);
+                PaintBranch(bg, BranchOX, BranchOY, 2);
+                composedBend = (float)bendPx;
             }
 
+#if PROFILE
+        profCompose += clock.Elapsed.TotalMilliseconds - qc;
+        double qb = clock.Elapsed.TotalMilliseconds;
+#endif
         // The branch stays at home while the monkey visits a tab.
-        int bx = (int)Math.Round(PX + home.X - anchor.X) - BranchOX, by = (int)Math.Round(PY + home.Y - anchor.Y) - BranchOY;
+        int bx = (int)Math.Round(PX + (home.X - anchor.X) / S) - BranchOX, by = (int)Math.Round(PY + (home.Y - anchor.Y) / S) - BranchOY;
         var dest = new Rectangle(bx, by, BranchW, BranchH);
         // Bend by turning the whole branch a touch around where it joins the tree.
         var st = g.Save();
-        float px = bx + BranchOX + PivotX, py = by + BranchOY + PivotY;
-        g.TranslateTransform(px, py);
-        g.RotateTransform((float)(Math.Atan2(-bendPx, PivotX) * 180 / Math.PI));
-        g.TranslateTransform(-px, -py);
         if (branchAlpha > 0.98f) g.DrawImage(branchCache, dest);
         else
         {
@@ -2392,19 +2509,37 @@ public class Monkey : Form
             }
         }
         g.Restore(st);
+#if PROFILE
+        profBlit += clock.Elapsed.TotalMilliseconds - qb;
+#endif
     }
 
-    void PaintBranch(Graphics g, float bx, float by)
+    // layer 0: leaves behind the wood, 1: the wood (branch, twigs, knot), 2: leaves in front.
+    void PaintBranch(Graphics g, float bx, float by, int layer)
     {
         Color bark = Color.FromArgb(255, 112, 74, 40);
         float shake = (float)Math.Max(-2, Math.Min(2, bendVel * 0.025));   // leaves rustle when the branch bounces
         float sway = (float)Math.Sin(t * 1.6) + shake, sway2 = (float)Math.Sin(t * 1.3 + 1.7) - shake;
 
         // Twigs behind the main branch, with their leaf clusters.
+        if (layer == 0)
+        {
+            LeafCluster(g, bx - 84, by + 17, 160, sway2, 3);
+            LeafCluster(g, bx - 32, by + 15, 110, sway, 2);
+            return;
+        }
+        if (layer == 2)
+        {
+            LeafCluster(g, bx + 40, by + 14, 70, sway, 3);
+            LeafCluster(g, bx + 102, by + 15, 85, sway2, 2);
+            LeafCluster(g, bx + 102, by - 11, 15, sway, 2);   // sprouting from the outside of the bend
+            LeafCluster(g, bx - 97, by + BranchY(-97), 190, sway, 2);   // leaves at the thin tip
+            Leaf(g, bx + 12, by - 1, 300 + sway * 4, 13, 255, 1);
+            Leaf(g, bx - 70, by + 4, 120 - sway * 4, 14, 255, 2);
+            return;
+        }
         Twig(g, bark, bx, by, new[] { new PointF(-58, 1), new PointF(-70, 10), new PointF(-84, 17) }, 3.6f, 1.2f);
-        LeafCluster(g, bx - 84, by + 17, 160, sway2, 3);
         Twig(g, bark, bx, by, new[] { new PointF(-22, 1), new PointF(-28, 8), new PointF(-32, 15) }, 3f, 1f);
-        LeafCluster(g, bx - 32, by + 15, 110, sway, 2);
 
         // Main branch: comes down from the top of the screen on the right (the tree is up there), thickest
         // where it enters, bends over and runs left, tapering to a thin tip with a slight droop.
@@ -2489,15 +2624,9 @@ public class Monkey : Form
         Twig(g, bark, bx, by, new[] { new PointF(-46, -1), new PointF(-50, -6), new PointF(-52, -9) }, 3f, 2.6f);
         using (var b = new SolidBrush(Color.FromArgb(255, 214, 180, 130))) g.FillEllipse(b, bx - 54, by - 11.5f, 4.5f, 3.5f);   // pale broken end
 
-        // Twigs in front, hanging down and out to the side (the top of the screen is just above), with leaves.
+        // Twigs in front, hanging down and out to the side (the top of the screen is just above); their leaves are layer 2.
         Twig(g, bark, bx, by, new[] { new PointF(22, -1), new PointF(32, 5), new PointF(40, 14) }, 3.4f, 1.1f);
-        LeafCluster(g, bx + 40, by + 14, 70, sway, 3);
         Twig(g, bark, bx, by, new[] { new PointF(88, -4), new PointF(98, 4), new PointF(102, 15) }, 3.6f, 1.1f);
-        LeafCluster(g, bx + 102, by + 15, 85, sway2, 2);
-        LeafCluster(g, bx + 102, by - 11, 15, sway, 2);   // sprouting from the outside of the bend
-        LeafCluster(g, bx - 97, by + BranchY(-97), 190, sway, 2);   // leaves at the thin tip
-        Leaf(g, bx + 12, by - 1, 300 + sway * 4, 13, 255, 1);
-        Leaf(g, bx - 70, by + 4, 120 - sway * 4, 14, 255, 2);
     }
 
     // Height of the branch's centre line at x (0 where the tail wraps around it).
@@ -2589,29 +2718,52 @@ public class Monkey : Form
     }
 
     // Draws either the turns behind the branch (in shadow, before the branch) or the ones in front.
+    // Each unbroken stretch is one smooth line with one pen (much quicker than lots of little pieces);
+    // only the tapering tip is drawn piece by piece.
     static void TailCoil(Graphics g, bool front, float w)
     {
         const int N = 72;
-        for (int pass = 0; pass < 2; pass++)
-        {
-            PointF prev = CoilPoint(CoilStart, w);
-            for (int i = 1; i <= N; i++)
+        double step = (CoilEnd - CoilStart) / N, taper = 0.9 * Math.PI;
+        float full = w * 0.8f;   // a little squeezed where it grips
+        Color fill = front ? Fur : Dark(Fur, 0.35f);
+        using (var outline = RoundPen(Outline, full + 2 * OL))
+        using (var body = RoundPen(fill, full))
+        using (var shine = RoundPen(Color.FromArgb(60, 255, 220, 180), full * 0.3f))
+            for (int pass = 0; pass < 2; pass++)
             {
-                double th = CoilStart + (CoilEnd - CoilStart) * i / N;
-                PointF p = CoilPoint(th, w);
-                if ((Math.Sin(th - (CoilEnd - CoilStart) / N / 2) > 0) == front)
+                var run = new List<PointF>();
+                PointF prev = CoilPoint(CoilStart, w);
+                for (int i = 1; i <= N + 1; i++)
                 {
-                    float k = (float)Math.Min(1, (th - CoilStart) / (0.9 * Math.PI));   // the tip tapers
-                    float ww = w * 0.8f * (0.45f + 0.55f * k);   // a little squeezed where it grips
-                    Color fill = front ? Fur : Dark(Fur, 0.35f);
-                    using (var pen = RoundPen(pass == 0 ? Outline : fill, pass == 0 ? ww + 2 * OL : ww)) g.DrawLine(pen, prev, p);
-                    if (pass == 1 && front)   // a soft shine along each front turn, so it looks round
-                        using (var hl = RoundPen(Color.FromArgb(60, 255, 220, 180), ww * 0.3f))
-                            g.DrawLine(hl, prev.X - ww * 0.15f, prev.Y, p.X - ww * 0.15f, p.Y);
+                    double th = CoilStart + step * i;
+                    bool mine = i <= N && (Math.Sin(th - step / 2) > 0) == front;
+                    PointF p = i <= N ? CoilPoint(th, w) : prev;
+                    if (mine && th - CoilStart < taper)
+                    {
+                        // The tip tapers: a piece at a time.
+                        float ww = full * (0.45f + 0.55f * (float)((th - CoilStart) / taper));
+                        using (var pen = RoundPen(pass == 0 ? Outline : fill, pass == 0 ? ww + 2 * OL : ww)) g.DrawLine(pen, prev, p);
+                    }
+                    else if (mine)
+                    {
+                        if (run.Count == 0) run.Add(prev);
+                        run.Add(p);
+                    }
+                    if ((!mine || i > N) && run.Count > 1)
+                    {
+                        var pts = run.ToArray();
+                        g.DrawLines(pass == 0 ? outline : body, pts);
+                        if (pass == 1 && front)   // a soft shine along each front turn, so it looks round
+                        {
+                            for (int j = 0; j < pts.Length; j++) pts[j].X -= full * 0.15f;
+                            g.DrawLines(shine, pts);
+                        }
+                        run.Clear();
+                    }
+                    else if (!mine) run.Clear();
+                    prev = p;
                 }
-                prev = p;
             }
-        }
     }
 
     void DrawTail(Graphics g, float hx, float hy, float dx, float dy, double r)
@@ -2673,13 +2825,21 @@ public class Monkey : Form
         // A pocket on the hip, with its snack sticking out (until it's taken out to eat).
         bool bananaTaken = shown == Act.Eat && actW > 0.05f && clock.Elapsed.TotalSeconds - actStart >= GrabTime;
         // It snacks all day, so the pocket is stuffed with a bunch; it pulls the middle one out to eat.
-        if (perchK < 0.5f)   // sitting, the jacket's upside down, so they're tucked right in
+        // It never moves, so it's drawn once (at double size, to stay sharp) for each way it can look.
+        bool showBananas = perchK < 0.5f;   // sitting, the jacket's upside down, so they're tucked right in
+        string pocketKey = "pocket" + (showBananas ? (bananaTaken ? "2" : "3") : "0") + (bananaTaken ? "e" : "f");
+        Bitmap pocket = Sprite(pocketKey, 56, 72, 0, 32, pg =>
         {
-            DrawBanana(g, new PointF(PocketGrip.X - 5.5f, PocketGrip.Y + 2), 165, PocketScale * 0.95f, 0, 1, false);
-            DrawBanana(g, new PointF(PocketGrip.X + 5.5f, PocketGrip.Y + 1.5f), 197, PocketScale * 0.95f, 0, 1, false);
-            if (!bananaTaken) DrawBanana(g, PocketGrip, 180, PocketScale, 0, 1, false);
-        }
-        DrawPocket(g, !bananaTaken);
+            pg.ScaleTransform(2, 2);
+            if (showBananas)
+            {
+                DrawBanana(pg, new PointF(PocketGrip.X - 5.5f, PocketGrip.Y + 2), 165, PocketScale * 0.95f, 0, 1, false);
+                DrawBanana(pg, new PointF(PocketGrip.X + 5.5f, PocketGrip.Y + 1.5f), 197, PocketScale * 0.95f, 0, 1, false);
+                if (!bananaTaken) DrawBanana(pg, PocketGrip, 180, PocketScale, 0, 1, false);
+            }
+            DrawPocket(pg, !bananaTaken);
+        });
+        g.DrawImage(pocket, new RectangleF(0, -16, 28, 36));
 
         // Arms in puffer sleeves: dangling below the head, unless it is busy with a habit.
         PointF restL = new PointF(-28 + lag, 88), restR = new PointF(28 + lag, 88);
@@ -2702,6 +2862,7 @@ public class Monkey : Form
             var inv = g.Transform.Clone();
             inv.Invert();
             var bz = (PointF[])tailBez.Clone();
+            baseM.TransformPoints(bz);
             inv.TransformPoints(bz);
             inv.Dispose();
             tL = ClimbHand(bz, ap, 0f, -1, restL, out gripL, out angL);
@@ -3105,8 +3266,8 @@ public class Monkey : Form
 
     void DrawFlyingPeel(Graphics g)
     {
-        Point wp = WindowPos;
-        float px = peelPos.X - wp.X, py = peelPos.Y - wp.Y;
+        PointF lp = ToLocalF(peelPos);
+        float px = lp.X, py = lp.Y;
         float fade = Math.Max(0, Math.Min(1, (H - py) / 70f)) * (float)Math.Min(1, (1.8 - peelAge) / 0.4);
         if (fade <= 0.02f) return;
         var st = g.Save();
