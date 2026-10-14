@@ -50,6 +50,25 @@ public class Monkey : Form
     [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
     [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    static extern void SHCreateItemFromParsingName(string path, IntPtr bindCtx, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, out IShellItem item);
+    [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItem
+    {
+        void BindToHandler(IntPtr bindCtx, [MarshalAs(UnmanagedType.LPStruct)] Guid bhid, [MarshalAs(UnmanagedType.LPStruct)] Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppv);
+        void GetParent(out IShellItem parent);
+        void GetDisplayName(uint sigdn, [MarshalAs(UnmanagedType.LPWStr)] out string name);
+        void GetAttributes(uint mask, out uint attributes);
+        void Compare(IShellItem other, uint hint, out int order);
+    }
+    [ComImport, Guid("70629033-e363-4a28-a567-0db78006e6d7"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IEnumShellItems
+    {
+        [PreserveSig] int Next(uint count, [MarshalAs(UnmanagedType.Interface)] out IShellItem item, out uint fetched);
+        void Skip(uint count);
+        void Reset();
+        void Clone(out IEnumShellItems copy);
+    }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
@@ -1208,7 +1227,7 @@ public class Monkey : Form
     RectangleF pendingTab;
     IntPtr pendingWindow;
     double pullStart, pullFrom, pullDist;
-    const double PullTime = 0.4;
+    const double PullTime = 0.32;
     const int ShadowH = 18;
 
     // Starting the app again while it's running (say, after hiding it and forgetting about hold-M)
@@ -1258,6 +1277,9 @@ public class Monkey : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         LoadSettings();
+        // Read the Start menu's apps a few seconds after starting (the shell takes ~3 s to list them), so
+        // "open excel" never has to wait.
+        ThreadPool.QueueUserWorkItem(_ => { Thread.Sleep(5000); WarmApps(); });
         PlaceOnScreen();
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged += (s, e) => BeginInvoke((Action)(() => PlaceOnScreen()));
         // Started at sign-in, the taskbar may not be there yet: settle in again when it takes its space.
@@ -1374,6 +1396,9 @@ public class Monkey : Form
             foreach (var pr in Process.GetProcessesByName("chrome"))
                 if (pr.MainWindowHandle != IntPtr.Zero) { pendingWindow = pr.MainWindowHandle; break; }
             pendingTab = new RectangleF(home.X - 340, 0, 40, 41);
+            IntPtr demoWin = pendingWindow;
+            RectangleF demoTab = pendingTab;
+            pageShot = System.Threading.Tasks.Task.Factory.StartNew(() => TakePageShot(demoWin, demoTab));
 #if !HOLDDEMO
             hasPending = true;
 #endif
@@ -1857,48 +1882,75 @@ public class Monkey : Form
 
     static List<App> Apps()
     {
-        lock (appLock)
+        List<App> have = appList;
+        if (have != null)
         {
-            if (appList != null && (DateTime.UtcNow - appListAt).TotalMinutes < 10) return appList;
-            List<App> list = null;
-            // The Shell's objects want a single-threaded apartment: read them on a thread of their own.
-            var t = new Thread(() => { try { list = ReadAppsFolder(); } catch { } });
-            t.SetApartmentState(ApartmentState.STA);
-            t.IsBackground = true;
-            t.Start();
-            t.Join(8000);
-            if (list != null) { appList = list; appListAt = DateTime.UtcNow; }
-            return appList ?? new List<App>();
+            if ((DateTime.UtcNow - appListAt).TotalMinutes > 10) WarmApps();   // refresh in the background; use what we have
+            return have;
         }
+        // Not read yet (the first few seconds after starting): wait for it, it takes a few seconds the first time.
+        WarmApps();
+        var sw = Stopwatch.StartNew();
+        while (appList == null && appsLoading == 1 && sw.ElapsedMilliseconds < 8000) Thread.Sleep(30);
+        return appList ?? new List<App>();
     }
 
-    // Reads the list ahead of time, so the first "open ..." is instant.
-    static void WarmApps() { ThreadPool.QueueUserWorkItem(_ => Apps()); }
+    // The Shell's objects want a single-threaded apartment: use them on a thread of their own.
+    static T OnShellThread<T>(Func<T> work) where T : class
+    {
+        T result = null;
+        var t = new Thread(() => { try { result = work(); } catch { } });
+        t.SetApartmentState(ApartmentState.STA);
+        t.IsBackground = true;
+        t.Start();
+        t.Join(8000);
+        return result;
+    }
 
+    // Reads the list ahead of time (and refreshes it), so "open ..." never waits.
+    static int appsLoading;
+    static void WarmApps()
+    {
+        if (Interlocked.Exchange(ref appsLoading, 1) == 1) return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                List<App> list = OnShellThread(ReadAppsFolder);
+                if (list != null) lock (appLock) { appList = list; appListAt = DateTime.UtcNow; }
+            }
+            finally { appsLoading = 0; }
+        });
+    }
+
+    // Every app in the Start menu's "All apps", with the id that opens it, straight from the shell (a fraction of a second).
     static List<App> ReadAppsFolder()
     {
-        var call = System.Reflection.BindingFlags.InvokeMethod;
-        var get = System.Reflection.BindingFlags.GetProperty;
-        Type type = Type.GetTypeFromProgID("Shell.Application");
-        object shell = Activator.CreateInstance(type);
         var list = new List<App>();
+        IShellItem folder;
+        SHCreateItemFromParsingName("shell:AppsFolder", IntPtr.Zero, typeof(IShellItem).GUID, out folder);
+        object e;
+        folder.BindToHandler(IntPtr.Zero, new Guid("94f60519-2850-4924-aa5a-d15e84868039") /* BHID_EnumItems */, typeof(IEnumShellItems).GUID, out e);
+        var items = (IEnumShellItems)e;
         try
         {
-            object folder = type.InvokeMember("NameSpace", call, null, shell, new object[] { "shell:AppsFolder" });
-            object items = folder.GetType().InvokeMember("Items", call, null, folder, null);
-            int count = (int)items.GetType().InvokeMember("Count", get, null, items, null);
-            for (int i = 0; i < count; i++)
+            IShellItem it;
+            uint got;
+            while (items.Next(1, out it, out got) == 0 && got == 1)
             {
-                object it = items.GetType().InvokeMember("Item", call, null, items, new object[] { i });
-                if (it == null) continue;
-                string name = it.GetType().InvokeMember("Name", get, null, it, null) as string;
-                string id = it.GetType().InvokeMember("Path", get, null, it, null) as string;
-                if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(id) || NotAnApp.IsMatch(name)) continue;
-                if (id.StartsWith("http", StringComparison.OrdinalIgnoreCase)) continue;   // web links, not apps
-                list.Add(new App { Name = name.Trim(), Id = id });
+                try
+                {
+                    string name, id;
+                    it.GetDisplayName(0 /* SIGDN_NORMALDISPLAY */, out name);
+                    it.GetDisplayName(0x80018001 /* SIGDN_PARENTRELATIVEPARSING */, out id);
+                    if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(id) || NotAnApp.IsMatch(name)) continue;
+                    if (id.StartsWith("http", StringComparison.OrdinalIgnoreCase)) continue;   // web links, not apps
+                    list.Add(new App { Name = name.Trim(), Id = id });
+                }
+                finally { Marshal.ReleaseComObject(it); }
             }
         }
-        finally { Marshal.FinalReleaseComObject(shell); }
+        finally { Marshal.ReleaseComObject(items); Marshal.ReleaseComObject(folder); }
         return list;
     }
 
@@ -2624,7 +2676,8 @@ public class Monkey : Form
     FxLayer fx = new FxLayer();
     Bitmap fxBmp;
     Rectangle fxArea;
-    const double ThrowWind = 0.32, FlightTime = 0.42, BoomTime = 1.1;
+    const double ThrowWind = 0.2, BoomTime = 1.1;
+    double flightTime = 0.3;   // set for each throw: farther tabs take a little longer
 
     struct Bit { public PointF p, v; public float a, spin; public RectangleF src; }
     Bit[] debris = new Bit[0];
@@ -2667,7 +2720,7 @@ public class Monkey : Form
         float ddx = blastAt.X - hx, ddy = blastAt.Y - hy, len = Math.Max(1, (float)Math.Sqrt(ddx * ddx + ddy * ddy));
         throwDir = new PointF(ddx / len, ddy / len);
         handScreen = new PointF(hx, hy);
-        StartAct(Act.Throw, 0.9, now);
+        StartAct(Act.Throw, 0.7, now);
         grinTime = 0.9;
         Say(Pick("Bye bye, tab!", "Target locked!", "Fire in the hole!", "This one's mine!"), true);
         blastStart = now;
@@ -2705,9 +2758,11 @@ public class Monkey : Form
             if (fxBmp != null) fxBmp.Dispose();
             fxBmp = new Bitmap(fxArea.Width, fxArea.Height, PixelFormat.Format32bppArgb);
             flightStart = now;
+            double dist = Math.Sqrt(Math.Pow(blastAt.X - blastFrom.X, 2) + Math.Pow(blastAt.Y - blastFrom.Y, 2)) / S;
+            flightTime = Math.Max(0.2, Math.Min(0.34, 0.16 + dist / 6000));
             blastPhase = 2;
         }
-        if (blastPhase == 2 && now - flightStart >= FlightTime)
+        if (blastPhase == 2 && now - flightStart >= flightTime)
         {
             // Impact: close the tab for real, and blow its picture to bits.
             ReplayClick(blastClick);
@@ -2755,7 +2810,7 @@ public class Monkey : Form
             if (blastPhase == 2)
             {
                 // The banana, spinning along an arc, with a little trail.
-                float u = (float)Math.Min(1, (now - flightStart) / FlightTime);
+                float u = (float)Math.Min(1, (now - flightStart) / flightTime);
                 float dist = (float)Math.Sqrt(Math.Pow(blastAt.X - blastFrom.X, 2) + Math.Pow(blastAt.Y - blastFrom.Y, 2));
                 for (int i = 4; i >= 0; i--)
                 {
@@ -2891,6 +2946,10 @@ public class Monkey : Form
         pendingPt = clickAt;
         pendingTab = tab;
         pendingSince = clock.Elapsed.TotalSeconds;
+        // Take the old page's picture now, while it swings over, so the tab opens the moment it arrives.
+        IntPtr win = pendingWindow;
+        if (pageShot != null) { var old = pageShot; pageShot = null; ThreadPool.QueueUserWorkItem(_ => { try { var r = old.Result; if (r != null && r.Item1 != null) r.Item1.Dispose(); } catch { } }); }
+        pageShot = System.Threading.Tasks.Task.Factory.StartNew(() => TakePageShot(win, tab));
         travelTo = PointF.Empty;   // so GoToTab does not think it is already there
         GoToTab(new PointF(tab.X + tab.Width / 2, tab.Bottom - 6));
     }
@@ -2985,7 +3044,7 @@ public class Monkey : Form
             stepSnap[i] = rnd.NextDouble() < 0.5;                              // a quick snap or a lazy reach
         }
         // Never keep you waiting long for a tab.
-        double limit = hurry ? 0.45 : 0.8;
+        double limit = hurry ? 0.32 : 0.8;
         if (time > limit)
         {
             for (int i = 0; i < n; i++) stepTime[i] *= limit / time;
@@ -3102,29 +3161,28 @@ public class Monkey : Form
     // At a tab the monkey hangs by its hand; at the branch it hangs by its tail.
     bool HandPose { get { return mode != Mode.Home; } }
 
-    void StartPullDown()
+    System.Threading.Tasks.Task<Tuple<Bitmap, Rectangle>> pageShot;   // the old page, being snapshotted
+
+    // The browser's page area (below the tabs), drawn from the browser itself, so the monkey isn't in the picture.
+    static Tuple<Bitmap, Rectangle> TakePageShot(IntPtr window, RectangleF tab)
     {
-        Point clickAt = Point.Round(new PointF(pendingTab.X + Math.Min(20, pendingTab.Width / 2), pendingTab.Y + pendingTab.Height / 2 - 2));
         Bitmap shot = null;
-        Rectangle area = Rectangle.Empty;
         try
         {
             RECT r;
-            GetWindowRect(pendingWindow, out r);
-            Rectangle scr = Screen.FromHandle(pendingWindow).Bounds;
-            int top = (int)Math.Ceiling(pendingTab.Bottom);
-            area = Rectangle.FromLTRB(Math.Max(r.L, scr.Left), top, Math.Min(r.R, scr.Right), Math.Min(r.B, scr.Bottom));
-            if (area.Width < 50 || area.Height < 50) throw new Exception("window too small");
-
-            // Snapshot the browser itself (not the screen), so the monkey isn't in the picture.
+            GetWindowRect(window, out r);
+            Rectangle scr = Screen.FromHandle(window).Bounds;
+            int top = (int)Math.Ceiling(tab.Bottom);
+            var area = Rectangle.FromLTRB(Math.Max(r.L, scr.Left), top, Math.Min(r.R, scr.Right), Math.Min(r.B, scr.Bottom));
+            if (area.Width < 50 || area.Height < 50) return null;
             using (var full = new Bitmap(r.R - r.L, r.B - r.T))
             {
                 using (var g = Graphics.FromImage(full))
                 {
                     IntPtr dc = g.GetHdc();
-                    bool ok = PrintWindow(pendingWindow, dc, 2 /* PW_RENDERFULLCONTENT */);
+                    bool ok = PrintWindow(window, dc, 2 /* PW_RENDERFULLCONTENT */);
                     g.ReleaseHdc(dc);
-                    if (!ok) throw new Exception("PrintWindow failed");
+                    if (!ok) return null;
                 }
                 shot = new Bitmap(area.Width, area.Height + ShadowH, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
                 using (var g = Graphics.FromImage(shot))
@@ -3139,13 +3197,24 @@ public class Monkey : Form
                         g.DrawLine(edge, 0, ShadowH, area.Width, ShadowH);
                 }
             }
+            return Tuple.Create(shot, area);
         }
-        catch
+        catch { if (shot != null) shot.Dispose(); return null; }
+    }
+
+    void StartPullDown()
+    {
+        Point clickAt = Point.Round(new PointF(pendingTab.X + Math.Min(20, pendingTab.Width / 2), pendingTab.Y + pendingTab.Height / 2 - 2));
+        Tuple<Bitmap, Rectangle> taken = null;
+        try { if (pageShot != null && pageShot.Wait(400)) taken = pageShot.Result; } catch { }
+        pageShot = null;
+        if (taken == null)
         {
-            if (shot != null) shot.Dispose();
             ReplayClick(clickAt);   // couldn't snapshot: just open the tab
             return;
         }
+        Bitmap shot = taken.Item1;
+        Rectangle area = taken.Item2;
 
         // Cover the browser with the old page, switch tabs underneath, then pull it away.
         cover.Display(shot, area.Left, area.Top - ShadowH);
