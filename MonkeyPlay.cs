@@ -126,6 +126,14 @@ public class Monkey : Form
     float slowLevel, danceW;
     bool musicOn;
     int beatCount;
+    // Singing along while it dances: a few seconds of a phrase, a breath, then more. Silent: just its mouth,
+    // notes floating out, and now and then a line in a bubble (your music stays your music).
+    bool singing;
+    double singUntil, singRestUntil;
+    float singLevel;   // how wide it sings: follows the loudness
+    static readonly string[] Lyrics = {
+        "La la la \u266A", "Ooh ooh, ah ah \u266B", "Shoo-be-doo-bop \u266A", "Ba-na-na-na \u266B", "Dum dee dum \u266A",
+        "Doo-wop, doo-wop \u266B", "Yeah, yeah, yeah! \u266A", "Hmm hmm hmmm \u266B", "Na na na na, hey! \u266A", "Swing it! \u266B" };
     static readonly Color[] NoteColors = {
         Color.FromArgb(255, 255, 120, 170), Color.FromArgb(255, 90, 210, 240),
         Color.FromArgb(255, 255, 210, 70), Color.FromArgb(255, 160, 120, 255) };
@@ -1167,14 +1175,25 @@ public class Monkey : Form
     Dictionary<IntPtr, RectangleF> selectedTabs = new Dictionary<IntPtr, RectangleF>();   // the open tab of each window
     volatile bool browserInFront = true;
 
-    // Chrome/Edge tabs overlap their neighbours by about 18px at each end, and draw the close (x) about
-    // 28px in from the right edge. Narrow tabs only show the x on the open tab.
-    const float TabOverlap = 9, WideTab = 140;
+    // Chrome/Edge tabs overlap their neighbours by about 18px at each end. Narrow tabs only show the close (x)
+    // on the open tab.
+    const float TabOverlap = 9;
 
-    static bool OnCloseButton(PT pt, RectangleF r)
+    // Where the close (x) button sits in a tab, measured from the browser itself (its open tab's button), so it's
+    // right at any display scaling. Until it's measured: Chrome's own proportions, which grow with the tab's height.
+    sealed class CloseSpot { public float fromRightMin, fromRightMax, top, bottom, tabHeight; }
+    Dictionary<IntPtr, CloseSpot> closeSpots = new Dictionary<IntPtr, CloseSpot>();
+
+    static bool OnCloseButton(PT pt, RectangleF r, CloseSpot c)
     {
-        return pt.x >= r.Right - 37 && pt.x < r.Right - 19 && Math.Abs(pt.y - (r.Top + r.Height / 2)) <= 10;
+        float h = r.Height;
+        float fr0 = 0.32f * h, fr1 = 1.02f * h, top = 0.13f * h, bottom = 0.82f * h;
+        if (c != null && Math.Abs(c.tabHeight - h) < 2) { fr0 = c.fromRightMin; fr1 = c.fromRightMax; top = c.top; bottom = c.bottom; }
+        return pt.x >= r.Right - fr1 && pt.x < r.Right - fr0 && pt.y >= r.Top + top && pt.y < r.Top + bottom;
     }
+
+    // Wide enough that the browser shows a close (x) on a tab that isn't open (about 140px at 100% scaling).
+    static bool WideTab(RectangleF r) { return r.Width >= r.Height * 3.4f; }
 
     // Holding back your click on a tab until the monkey pulls it.
     HookProc hookProc;
@@ -1420,6 +1439,8 @@ public class Monkey : Form
                 bool anyFront = false;
                 var fresh = new Dictionary<IntPtr, List<RectangleF>>();
                 var selected = new Dictionary<IntPtr, RectangleF>();
+                Dictionary<IntPtr, CloseSpot> spots;
+                lock (tabLock) spots = new Dictionary<IntPtr, CloseSpot>(closeSpots);
 
                 foreach (IntPtr win in BrowserWindows(names))
                 {
@@ -1437,6 +1458,7 @@ public class Monkey : Form
                     // Fetch every tab's selected state, position and id in a single request.
                     string selectedId = null;
                     System.Windows.Rect selectedRect = System.Windows.Rect.Empty;
+                    AutomationElement selectedEl = null;
                     var others = new List<RectangleF>();
                     try
                     {
@@ -1450,6 +1472,7 @@ public class Monkey : Form
                             {
                                 selectedId = string.Join(".", (int[])tab.GetCachedPropertyValue(AutomationElement.RuntimeIdProperty));
                                 selectedRect = tr;
+                                selectedEl = tab;
                             }
                             else if (!tr.IsEmpty) others.Add(new RectangleF((float)tr.X, (float)tr.Y, (float)tr.Width, (float)tr.Height));
                         }
@@ -1457,7 +1480,10 @@ public class Monkey : Form
                     catch { strips.Remove(win); continue; }
                     fresh[win] = others;
                     if (!selectedRect.IsEmpty)
+                    {
                         selected[win] = new RectangleF((float)selectedRect.X, (float)selectedRect.Y, (float)selectedRect.Width, (float)selectedRect.Height);
+                        MeasureCloseButton(win, selectedEl, selectedRect, spots);
+                    }
 
                     // Swing over when you switch tabs some other way (keyboard, or a click it didn't hold).
                     if (selectedId == null) continue;
@@ -1472,13 +1498,37 @@ public class Monkey : Form
                     BeginInvoke(new Action(() => GoToTab(target)));
                 }
 
-                lock (tabLock) { browserTabs = fresh; selectedTabs = selected; }
+                lock (tabLock) { browserTabs = fresh; selectedTabs = selected; closeSpots = spots; }
                 browserInFront = anyFront;
                 // Forget closed windows.
                 foreach (var gone in new List<IntPtr>(strips.Keys)) if (!fresh.ContainsKey(gone)) strips.Remove(gone);
             }
             catch { /* a browser window closed or changed; try again next tick */ }
         }
+    }
+
+    // Finds the open tab's close (x) button once per window (and again if the tabs change height, as they do
+    // when the display scaling changes): the right-most button in the tab.
+    static void MeasureCloseButton(IntPtr win, AutomationElement tab, System.Windows.Rect r, Dictionary<IntPtr, CloseSpot> spots)
+    {
+        CloseSpot have;
+        if (tab == null || (spots.TryGetValue(win, out have) && Math.Abs(have.tabHeight - r.Height) < 2)) return;
+        try
+        {
+            var buttons = tab.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+            System.Windows.Rect best = System.Windows.Rect.Empty;
+            foreach (AutomationElement b in buttons)
+            {
+                var br = b.Current.BoundingRectangle;
+                if (br.IsEmpty || br.Width < 4 || br.Right > r.Right + 2 || br.Left < r.Left) continue;
+                if (best.IsEmpty || br.Right > best.Right) best = br;
+            }
+            if (best.IsEmpty || best.Width > r.Height * 1.5) return;   // nothing that looks like a close button
+            spots[win] = new CloseSpot {
+                fromRightMin = (float)(r.Right - best.Right), fromRightMax = (float)(r.Right - best.Left),
+                top = (float)(best.Top - r.Top), bottom = (float)(best.Bottom - r.Top), tabHeight = (float)r.Height };
+        }
+        catch { }
     }
 
     void GoToTab(PointF tab)
@@ -1522,13 +1572,24 @@ public class Monkey : Form
             {
                 if (msg == 0x202 /* LBUTTONUP */ && swallowUp) { swallowUp = false; return (IntPtr)1; }
                 RectangleF tab;
-                if (msg == 0x201 && blastTabs && blastPhase == 0 && mode == Mode.Home && !grabbed && !PerchedPose && sleepW < 0.5f
-                    && FindCloseButton(info.pt, out tab))
+                if (msg == 0x201 && blastTabs && !grabbed && FindCloseButton(info.pt, out tab))
                 {
-                    swallowUp = true;
                     var cp = new Point(info.pt.x, info.pt.y);
-                    BeginInvoke(new Action(() => StartBlast(tab, cp)));
-                    return (IntPtr)1;
+                    // Clicked the same x again while the banana's on its way: one banana, one tab.
+                    if ((blastPhase == 1 || blastPhase == 2) && tab == blastTab) { swallowUp = true; return (IntPtr)1; }
+                    if ((blastPhase == 0 || blastPhase == 3) && mode == Mode.Home)
+                    {
+                        swallowUp = true;
+                        BeginInvoke(new Action(() => StartBlast(tab, cp)));
+                        return (IntPtr)1;
+                    }
+                    if (!hasQueuedBlast)
+                    {
+                        // Off at a tab, or a banana's already flying: this one goes as soon as it can.
+                        swallowUp = true;
+                        hasQueuedBlast = true; queuedTab = tab; queuedClick = cp; queuedAt = clock.Elapsed.TotalSeconds;
+                        return (IntPtr)1;
+                    }
                 }
                 if (msg == 0x201 /* LBUTTONDOWN */ && pullTabs && !grabbed && mode != Mode.PullDown && FindTab(info.pt, out tab))
                 {
@@ -2550,6 +2611,11 @@ public class Monkey : Form
 
     bool blastTabs = true;
     volatile int blastPhase;      // 0 idle, 1 winding up, 2 banana flying, 3 exploding
+    // One click waiting for its banana (the monkey was off at a tab, or already throwing).
+    bool hasQueuedBlast;
+    RectangleF queuedTab;
+    Point queuedClick;
+    double queuedAt;
     double blastStart, flightStart, boomStart, quietUntil;
     RectangleF blastTab;
     Point blastClick;
@@ -2571,11 +2637,13 @@ public class Monkey : Form
         lock (tabLock)
         {
             RectangleF open;
-            if (selectedTabs.TryGetValue(under, out open) && OnCloseButton(pt, open)) { hit = open; return true; }
+            CloseSpot spot;
+            closeSpots.TryGetValue(under, out spot);
+            if (selectedTabs.TryGetValue(under, out open) && OnCloseButton(pt, open, spot)) { hit = open; return true; }
             List<RectangleF> tabs;
             if (browserTabs.TryGetValue(under, out tabs))
                 foreach (var r in tabs)
-                    if (r.Width >= WideTab && OnCloseButton(pt, r)) { hit = r; return true; }
+                    if (WideTab(r) && OnCloseButton(pt, r, spot)) { hit = r; return true; }
         }
         return false;
     }
@@ -2583,6 +2651,9 @@ public class Monkey : Form
     void StartBlast(RectangleF tab, Point click)
     {
         double now = clock.Elapsed.TotalSeconds;
+        if (blastPhase == 3) { fx.Hide(); if (tabShot != null) { tabShot.Dispose(); tabShot = null; } blastPhase = 0; }   // the last boom's nearly done
+        if (PerchedPose || perch == Perch.Up) LeavePerchNow(now);   // hops off its seat to throw
+        wakeUntil = Math.Max(wakeUntil, now + StayAwake);          // a close click wakes it up
         blastTab = tab; blastClick = click;
         blastAt = new PointF(tab.X + tab.Width / 2, tab.Y + tab.Height / 2);
         try
@@ -2605,6 +2676,23 @@ public class Monkey : Form
 
     void UpdateBlast(double now)
     {
+        if (hasQueuedBlast && (blastPhase == 0 || blastPhase == 3))
+        {
+            if (mode == Mode.Home && !grabbed)
+            {
+                hasQueuedBlast = false;
+                // Only if that tab is still right there (closing another tab can slide the tabs along).
+                RectangleF still;
+                if (FindCloseButton(new PT { x = queuedClick.X, y = queuedClick.Y }, out still) && still == queuedTab) StartBlast(queuedTab, queuedClick);
+                else Say(Pick("Oops, that tab moved! Click it again?", "It wiggled away! Try again?"), true);
+            }
+            else if (now - queuedAt > 4)
+            {
+                // Taking too long: close it the plain way.
+                hasQueuedBlast = false;
+                ReplayClick(queuedClick);
+            }
+        }
         if (blastPhase == 0) return;
         if (blastPhase == 1 && now - blastStart >= ThrowWind)
         {
@@ -2785,10 +2873,12 @@ public class Monkey : Form
         {
             List<RectangleF> tabs;
             if (!browserTabs.TryGetValue(under, out tabs)) return false;
+            CloseSpot spot;
+            closeSpots.TryGetValue(under, out spot);
             foreach (var r in tabs)
             {
                 // Leave the tab's close (x) button alone (narrow tabs don't show one), and the ends it shares with its neighbours.
-                if (r.Width >= WideTab && OnCloseButton(pt, r)) continue;
+                if (WideTab(r) && OnCloseButton(pt, r, spot)) continue;
                 if (pt.x >= r.Left + TabOverlap && pt.x < r.Right - TabOverlap && pt.y >= r.Top && pt.y < r.Bottom) { hit = r; pendingWindow = under; return true; }
             }
         }
@@ -3476,6 +3566,17 @@ public class Monkey : Form
         bool dance = musicOn && mode == Mode.Home && !grabbed && sleepW < 0.5f && !PerchedPose;
         danceW += ((dance ? 1 : 0) - danceW) * Ease(dance ? 4 : 3, dt);
 
+        bool canSing = danceW > 0.6f && sleepW < 0.1f && act == Act.None;
+        if (!canSing) { if (singing) singRestUntil = now + 1; singing = false; }
+        else if (singing && now > singUntil) { singing = false; singRestUntil = now + 1.5 + rnd.NextDouble() * 2.5; }
+        else if (!singing && now > singRestUntil)
+        {
+            singing = true;
+            singUntil = now + 3 + rnd.NextDouble() * 4;
+            if (rnd.Next(3) == 0) Say(Lyrics[rnd.Next(Lyrics.Length)], false, 2.5);   // only when no other line is due
+        }
+        singLevel += ((singing ? Math.Min(1, 0.35f + lv * 3) : 0) - singLevel) * Ease(10, dt);
+
         // A beat is a sudden jump in loudness; between clear beats it keeps its own groove.
         slowLevel += (lv - slowLevel) * Ease(1.5, dt);
         bool beat = (lv > 0.04f && lv > slowLevel * 1.3f && now - lastBeat > 0.28) || now - lastBeat > 0.75;
@@ -3489,8 +3590,21 @@ public class Monkey : Form
                 double punch = 0.6 + Math.Min(1, lv * 2);
                 vy -= 220 * punch * danceW;                                      // bounce on the tail
                 vx += (beatCount % 2 == 0 ? 1 : -1) * 100 * danceW;              // sway side to side
-                grinTime = Math.Max(grinTime, 0.5);
-                if (beatCount % 2 == 0)
+                if (!singing) grinTime = Math.Max(grinTime, 0.5);
+                if (singing)
+                {
+                    // A note out of its mouth on every beat.
+                    float side = beatCount % 2 == 0 ? 1 : -1;
+                    float mx = anchor.X + (float)(x + 82 * Math.Sin(bodyAngle)) * S;
+                    float my = anchor.Y + (float)(y + 82 * Math.Cos(bodyAngle)) * S;
+                    zzz.Add(new Zz
+                    {
+                        p = new PointF(mx + side * 8, my), drift = side * (14 + (float)rnd.NextDouble() * 14),
+                        note = true, ch = rnd.Next(2) == 0 ? "\u266B" : "\u266A",
+                        col = NoteColors[rnd.Next(NoteColors.Length)]
+                    });
+                }
+                else if (beatCount % 2 == 0)
                 {
                     float side = rnd.Next(2) == 0 ? -1 : 1;
                     float hx = anchor.X + (float)(x + 70 * Math.Sin(bodyAngle)) * S;
@@ -5438,6 +5552,16 @@ public class Monkey : Form
             float m = 3.4f + 1.3f * (float)Math.Sin(breathPhase);
             using (var b = new SolidBrush(Mouth)) g.FillEllipse(b, cx - m / 2, cy + 10.5f, m, m * 0.9f);
             using (var o = new Pen(Outline, 1.1f)) g.DrawEllipse(o, cx - m / 2, cy + 10.5f, m, m * 0.9f);
+        }
+        else if (singLevel > 0.05f && !grabbed && !chewing)
+        {
+            // Singing: two syllables a beat, wider when the music is louder, rounder ("ooh") the wider it opens.
+            float syl = Math.Abs((float)Math.Sin(beatPhase * Math.PI * 2));
+            float open = 2.5f + (4 + 5 * singLevel) * syl * singLevel;
+            float w = 11 - open * 0.3f;
+            using (var b = new SolidBrush(Mouth)) g.FillEllipse(b, cx - w / 2, cy + 9, w, open);
+            using (var b = new SolidBrush(Tongue)) if (open > 5) g.FillEllipse(b, cx - w / 2 + 2, cy + 9 + open - 3.5f, w - 4, 3.5f);
+            using (var o = new Pen(Outline, 1.2f)) g.DrawEllipse(o, cx - w / 2, cy + 9, w, open);
         }
         else if (Talking && !grabbed && !chewing)
         {
