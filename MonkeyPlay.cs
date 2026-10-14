@@ -10,6 +10,17 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 using System.Text.RegularExpressions;
+using System.Reflection;
+
+// Monkey Play, created by Binu Madhavan. Copyright (c) 2026 Binu Madhavan. All rights reserved.
+// These show in the exe's Properties > Details.
+[assembly: AssemblyTitle("Monkey Play - a desktop monkey by Binu Madhavan")]
+[assembly: AssemblyProduct("Monkey Play")]
+[assembly: AssemblyDescription("A desktop monkey by Binu Madhavan")]
+[assembly: AssemblyCompany("Binu Madhavan")]
+[assembly: AssemblyCopyright("Copyright © 2026 Binu Madhavan. All rights reserved.")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
 
 // A cool cartoon monkey (shades, puffer jacket) hanging by its tail from a branch at the top-right of the screen.
 // Works with touch or mouse:
@@ -182,6 +193,618 @@ public class Monkey : Form
         sayStart = now;
         sayLen = Math.Max(minLen, 1.8 + text.Length * 0.06);
         lastSay = now;
+    }
+
+    // ---- Laptop check-up ----
+    // A look at how the laptop is doing, with tips. It only LOOKS: it never changes, deletes, installs or turns
+    // anything off, never asks for admin rights, and nothing it finds leaves the PC. Each tip comes with a link to
+    // the Windows Settings page where you can act on it yourself.
+
+    sealed class Checkup
+    {
+        public List<string> Lines = new List<string>(), Tips = new List<string>();
+        public List<KeyValuePair<string, string>> Links = new List<KeyValuePair<string, string>>();   // label, settings page
+        public int Problems;
+        public string Brief = "";      // numbers only, for Monkey if you ask it about your laptop
+        public DateTime At;
+    }
+    volatile Checkup checkup;
+    int checkupRunning;
+    DateTime lowDiskWarned;
+    double nextDiskCheck = 60;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MEMORYSTATUSEX { public uint dwLength, dwMemoryLoad; public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual; }
+    [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX m);
+    [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
+    [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct SHQUERYRBINFO { public int cbSize; public long i64Size, i64NumItems; }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHQueryRecycleBin(string root, ref SHQUERYRBINFO info);
+
+    static string Gb(double bytes) { return (bytes / (1024.0 * 1024 * 1024)).ToString(bytes >= 10.0 * 1024 * 1024 * 1024 ? "0" : "0.0") + " GB"; }
+
+    static Checkup RunCheckup()
+    {
+        var c = new Checkup { At = DateTime.Now };
+        var brief = new List<string>();
+        Action<string, string> link = (label, page) => { if (!c.Links.Any(l => l.Value == page)) c.Links.Add(new KeyValuePair<string, string>(label, page)); };
+
+        // Storage: free space on each drive, and the SSD/disk's own health report.
+        foreach (var d in System.IO.DriveInfo.GetDrives())
+        {
+            try
+            {
+                if (d.DriveType != System.IO.DriveType.Fixed || !d.IsReady) continue;
+                double free = d.AvailableFreeSpace, size = d.TotalSize, share = free / size;
+                c.Lines.Add("Drive " + d.Name.TrimEnd('\\') + " " + Gb(free) + " free of " + Gb(size) + " (" + (int)Math.Round(share * 100) + "%)" + (share < 0.1 ? "  \u26A0" : ""));
+                brief.Add("disk " + d.Name.TrimEnd('\\') + " " + (int)Math.Round(share * 100) + "% free");
+                if (share < 0.15 || free < 20.0 * 1024 * 1024 * 1024)
+                {
+                    c.Problems++;
+                    c.Tips.Add("Drive " + d.Name.TrimEnd('\\') + " is getting full. Windows slows down and updates fail when it's nearly full. Turn on Storage Sense "
+                        + "to clear temporary files automatically, and look at Settings > System > Storage for what's using the space.");
+                    link("Storage settings", "ms-settings:storagesense");
+                }
+            }
+            catch { }
+        }
+        try
+        {
+            using (var q = new System.Management.ManagementObjectSearcher(@"root\Microsoft\Windows\Storage", "SELECT FriendlyName, HealthStatus, MediaType FROM MSFT_PhysicalDisk"))
+                foreach (System.Management.ManagementObject o in q.Get())
+                {
+                    int health = Convert.ToInt32(o["HealthStatus"] ?? 0);
+                    int media = Convert.ToInt32(o["MediaType"] ?? 0);
+                    string kind = media == 4 ? "SSD" : media == 3 ? "hard disk" : "disk";
+                    string state = health == 0 ? "healthy" : health == 1 ? "WARNING" : "FAILING";
+                    c.Lines.Add("Drive hardware (" + kind + "): " + state + (health == 0 ? "" : "  \u26A0"));
+                    brief.Add(kind + " " + state);
+                    if (health != 0)
+                    {
+                        c.Problems += 2;
+                        c.Tips.Insert(0, "Your " + kind + " reports a problem with itself. Back up your important files NOW (OneDrive, or an external drive), "
+                            + "then get it checked or replaced. This is the most important tip here.");
+                        link("Back up with OneDrive", "ms-settings:backup");
+                    }
+                }
+        }
+        catch { }
+
+        // Memory and how busy the processor is.
+        var mem = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) };
+        if (GlobalMemoryStatusEx(ref mem))
+        {
+            double total = mem.ullTotalPhys, used = total - mem.ullAvailPhys;
+            int load = (int)Math.Round(100 * used / total);
+            c.Lines.Add("Memory (RAM): " + Gb(used) + " used of " + Gb(total) + " (" + load + "%)" + (load >= 85 ? "  \u26A0" : ""));
+            brief.Add("RAM " + load + "% used of " + Gb(total));
+            if (load >= 85)
+            {
+                c.Problems++;
+                string top = "";
+                try
+                {
+                    top = string.Join(", ", Process.GetProcesses()
+                        .GroupBy(pr => { try { return pr.ProcessName; } catch { return ""; } })
+                        .Where(g => g.Key.Length > 0 && g.Key != "Memory Compression" && g.Key != "System" && g.Key != "Idle")
+                        .Select(g => new { g.Key, Bytes = g.Sum(pr => { try { return pr.WorkingSet64; } catch { return 0L; } }) })
+                        .OrderByDescending(x => x.Bytes).Take(3)
+                        .Select(x => x.Key + " (" + Gb(x.Bytes) + ")"));
+                }
+                catch { }
+                c.Tips.Add("Memory is nearly full, which makes everything slow. Biggest users right now: " + top + ". "
+                    + "Closing browser tabs you don't need helps most." + (total < 9.0 * 1024 * 1024 * 1024
+                    ? " With " + Gb(total) + " of RAM, Windows 11 is often tight; if your laptop has a free memory slot, adding 8 GB is the single best speed-up." : ""));
+                link("Task Manager", "taskmgr.exe");
+            }
+        }
+        try
+        {
+            long i0, k0, u0, i1, k1, u1;
+            GetSystemTimes(out i0, out k0, out u0);
+            Thread.Sleep(700);
+            GetSystemTimes(out i1, out k1, out u1);
+            double busy = 1 - (double)(i1 - i0) / Math.Max(1, (k1 - k0) + (u1 - u0));
+            int cpu = (int)Math.Round(Math.Max(0, Math.Min(1, busy)) * 100);
+            c.Lines.Add("Processor: " + cpu + "% busy right now" + (cpu >= 80 ? "  \u26A0" : ""));
+            if (cpu >= 80)
+            {
+                c.Tips.Add("The processor is very busy right now. If the laptop feels slow or hot, check Task Manager (Ctrl+Shift+Esc) for what's using it.");
+                link("Task Manager", "taskmgr.exe");
+            }
+        }
+        catch { }
+
+        // Restarts and updates.
+        double days = GetTickCount64() / 86400000.0;
+        c.Lines.Add("Last restart: " + (days < 1 ? "today" : Math.Round(days) + " day" + (Math.Round(days) == 1 ? "" : "s") + " ago") + (days >= 7 ? "  \u26A0" : ""));
+        brief.Add("restarted " + days.ToString("0.#") + " days ago");
+        bool rebootPending = false;
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"))
+                rebootPending = k != null;
+        }
+        catch { }
+        if (rebootPending)
+        {
+            c.Problems++;
+            c.Lines.Add("Windows updates: waiting for a restart  \u26A0");
+            c.Tips.Add("Windows has updates installed that only finish after a restart. Save your work and restart when you can.");
+        }
+        else if (days >= 7)
+        {
+            c.Problems++;
+            c.Tips.Add("It's been " + Math.Round(days) + " days since the last restart. A restart (not just closing the lid) clears out memory and finishes updates.");
+        }
+        DateTime lastUpdate = LastWindowsUpdate();
+        if (lastUpdate > DateTime.MinValue)
+        {
+            int ago = (int)(DateTime.Now - lastUpdate).TotalDays;
+            c.Lines.Add("Last Windows update: " + (ago <= 0 ? "today" : ago + " day" + (ago == 1 ? "" : "s") + " ago") + (ago > 45 ? "  \u26A0" : ""));
+            brief.Add("last Windows update " + ago + " days ago");
+            if (ago > 45)
+            {
+                c.Problems++;
+                c.Tips.Add("Windows hasn't installed a big update in " + ago + " days. Updates fix security holes; check Windows Update.");
+                link("Windows Update", "ms-settings:windowsupdate");
+            }
+        }
+
+        // Protection: which antivirus is on and up to date.
+        try
+        {
+            var on = new List<string>(); var off = new List<string>(); bool outdated = false;
+            using (var q = new System.Management.ManagementObjectSearcher(@"root\SecurityCenter2", "SELECT displayName, productState FROM AntiVirusProduct"))
+                foreach (System.Management.ManagementObject o in q.Get())
+                {
+                    string name = (o["displayName"] as string ?? "").Trim();
+                    int st = Convert.ToInt32(o["productState"] ?? 0);
+                    bool enabled = ((st >> 12) & 0xF) == 1 || ((st >> 12) & 0xF) == 3;
+                    bool current = ((st >> 4) & 0xF) == 0;
+                    if (enabled) { on.Add(name); if (!current) outdated = true; } else off.Add(name);
+                }
+            if (on.Count > 0) c.Lines.Add("Antivirus: " + string.Join(", ", on) + " is on" + (outdated ? " but OUT OF DATE  \u26A0" : " and up to date"));
+            else c.Lines.Add("Antivirus: none turned on  \u26A0");
+            brief.Add(on.Count > 0 ? "antivirus on" + (outdated ? " (out of date)" : "") : "no antivirus on");
+            if (on.Count == 0 || outdated)
+            {
+                c.Problems += 2;
+                c.Tips.Insert(0, on.Count == 0 ? "No antivirus is turned on. Open Windows Security and turn on Virus & threat protection (it's free and built in)."
+                                               : "Your antivirus is out of date. Open Windows Security and check for protection updates.");
+                link("Windows Security", "windowsdefender:");
+            }
+            if (off.Count > 0 && on.Count > 0)
+            {
+                c.Lines.Add("Also installed but turned off: " + string.Join(", ", off));
+                c.Tips.Add(string.Join(" and ", off) + " is installed but turned off (often a trial that ended). You're protected by " + on[0]
+                    + ", so if you don't use " + (off.Count == 1 ? "it" : "them") + ", uninstalling stops the pop-ups and frees up the laptop a little.");
+                link("Installed apps", "ms-settings:appsfeatures");
+            }
+        }
+        catch { }
+
+        // Apps that start with Windows.
+        int startup = StartupAppCount();
+        if (startup >= 0)
+        {
+            c.Lines.Add("Apps starting with Windows: " + startup + (startup > 10 ? "  \u26A0" : ""));
+            if (startup > 10)
+            {
+                c.Problems++;
+                c.Tips.Add(startup + " apps start every time you turn on. Turning off the ones you don't need at start-up makes the laptop start and run faster "
+                    + "(they still work when you open them).");
+                link("Startup apps", "ms-settings:startupapps");
+            }
+        }
+
+        // Clutter you can clear.
+        long temp = FolderSize(System.IO.Path.GetTempPath(), 2000);
+        var rb = new SHQUERYRBINFO { cbSize = Marshal.SizeOf(typeof(SHQUERYRBINFO)) };
+        long bin = SHQueryRecycleBin(null, ref rb) == 0 ? rb.i64Size : 0;
+        if (temp > 0 || bin > 0)
+            c.Lines.Add("Clearable: " + (temp > 0 ? "temporary files about " + Gb(temp) : "") + (temp > 0 && bin > 0 ? ", " : "") + (bin > 0 ? "Recycle Bin " + Gb(bin) : ""));
+        if (temp + bin > 2.0 * 1024 * 1024 * 1024)
+        {
+            c.Tips.Add("About " + Gb(temp + bin) + " is in temporary files and the Recycle Bin. Settings > System > Storage > Temporary files clears it safely.");
+            link("Storage settings", "ms-settings:storagesense");
+        }
+
+        // Battery (from the battery check, when there is one).
+        BatteryReport br = battery;
+        if (HasBattery && br != null && br.Original > 0)
+        {
+            c.Lines.Add("Battery health: " + br.Health + "%" + (br.Health < 60 ? "  \u26A0" : "") + " (type \"battery\" for details)");
+            brief.Add("battery health " + br.Health + "%");
+            if (br.Health < 60) c.Problems++;
+        }
+
+        c.Brief = string.Join(", ", brief);
+        return c;
+    }
+
+    // The newest successful update from Windows Update's history (not virus definitions, which come every day).
+    static DateTime LastWindowsUpdate()
+    {
+        try
+        {
+            var call = System.Reflection.BindingFlags.InvokeMethod;
+            var get = System.Reflection.BindingFlags.GetProperty;
+            object session = Activator.CreateInstance(Type.GetTypeFromProgID("Microsoft.Update.Session"));
+            object searcher = session.GetType().InvokeMember("CreateUpdateSearcher", call, null, session, null);
+            int total = (int)searcher.GetType().InvokeMember("GetTotalHistoryCount", call, null, searcher, null);
+            object hist = searcher.GetType().InvokeMember("QueryHistory", call, null, searcher, new object[] { 0, Math.Min(total, 40) });
+            int n = (int)hist.GetType().InvokeMember("Count", get, null, hist, null);
+            for (int i = 0; i < n; i++)
+            {
+                object e = hist.GetType().InvokeMember("Item", get, null, hist, new object[] { i });
+                string title = e.GetType().InvokeMember("Title", get, null, e, null) as string ?? "";
+                int result = Convert.ToInt32(e.GetType().InvokeMember("ResultCode", get, null, e, null));
+                if (result != 2 || Regex.IsMatch(title, @"Security Intelligence|antimalware platform|Defender Antivirus", RegexOptions.IgnoreCase)) continue;
+                return ((DateTime)e.GetType().InvokeMember("Date", get, null, e, null)).ToLocalTime();
+            }
+        }
+        catch { }
+        return DateTime.MinValue;
+    }
+
+    // Apps set to start with Windows (the Run lists and Startup folders), minus the ones turned off in Settings.
+    static int StartupAppCount()
+    {
+        try
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var off = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Action<Microsoft.Win32.RegistryKey, string, bool> read = (hive, path, approved) =>
+            {
+                using (var k = hive.OpenSubKey(path))
+                    if (k != null)
+                        foreach (string v in k.GetValueNames())
+                        {
+                            if (!approved) { if (v.Length > 0) names.Add(v); continue; }
+                            var data = k.GetValue(v) as byte[];
+                            if (data != null && data.Length > 0 && data[0] % 2 == 1) off.Add(v);   // odd first byte = turned off
+                        }
+            };
+            var cu = Microsoft.Win32.Registry.CurrentUser; var lm = Microsoft.Win32.Registry.LocalMachine;
+            read(cu, @"Software\Microsoft\Windows\CurrentVersion\Run", false);
+            read(lm, @"Software\Microsoft\Windows\CurrentVersion\Run", false);
+            read(lm, @"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run", false);
+            foreach (string dir in new[] { Environment.GetFolderPath(Environment.SpecialFolder.Startup), Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup) })
+                try { foreach (string f in System.IO.Directory.GetFiles(dir)) if (!f.EndsWith("desktop.ini", StringComparison.OrdinalIgnoreCase)) names.Add(System.IO.Path.GetFileName(f)); } catch { }
+            read(cu, @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", true);
+            read(lm, @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", true);
+            read(lm, @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32", true);
+            read(cu, @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", true);
+            return names.Count(n => !off.Contains(n));
+        }
+        catch { return -1; }
+    }
+
+    // How much is in a folder, counting for at most 'ms' milliseconds (so a huge temp folder can't hold things up).
+    static long FolderSize(string dir, int ms)
+    {
+        long total = 0;
+        var sw = Stopwatch.StartNew();
+        var stack = new Stack<string>(); stack.Push(dir);
+        while (stack.Count > 0 && sw.ElapsedMilliseconds < ms)
+        {
+            string d = stack.Pop();
+            try
+            {
+                foreach (var e in new System.IO.DirectoryInfo(d).EnumerateFileSystemInfos())
+                {
+                    if ((e.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) continue;
+                    if ((e.Attributes & System.IO.FileAttributes.Directory) != 0) stack.Push(e.FullName);
+                    else total += ((System.IO.FileInfo)e).Length;
+                }
+            }
+            catch { }
+        }
+        return total;
+    }
+
+    // "Laptop check-up" from the menu, or "check my laptop" in the chat.
+    void AskCheckup(bool typed, string q)
+    {
+        OpenChat();
+        if (typed) chat.AddMessage("You", q);
+        if (Interlocked.Exchange(ref checkupRunning, 1) == 1) { chat.AddNote("I'm already checking, one moment..."); return; }
+        chat.AddNote("Giving your laptop a check-up... (I only look; I don't change anything)");
+        chat.SetBusy(true);
+        Say(Pick("Stethoscope on! Let me check...", "Check-up time! Say \"ahh\"...", "Let me have a look..."), true, 10);
+        if (act == Act.None && mode == Mode.Home && perch == Perch.None) StartAct(Act.Look, 3, clock.Elapsed.TotalSeconds);
+        bool needBattery = HasBattery && (battery == null || (DateTime.UtcNow - battery.At).TotalHours > 24);
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Checkup c = null;
+            try
+            {
+                if (needBattery) try { var r = ReadBatteryReport(); if (r != null) battery = r; } catch { }
+                c = RunCheckup();
+                checkup = c;
+            }
+            catch { }
+            finally { checkupRunning = 0; }
+            try { BeginInvoke((Action)(() => { chat.SetBusy(false); ShowCheckup(c); })); } catch { }
+        });
+    }
+
+    void ShowCheckup(Checkup c)
+    {
+        if (c == null) { chat.AddNote("Hmm, the check-up didn't work this time. Try again in a moment?"); return; }
+        var sb = new System.Text.StringBuilder();
+        sb.Append(c.Problems == 0 ? "Your laptop's in good shape! \U0001F412\n" : c.Problems <= 2 ? "Mostly fine, with a couple of things to look at:\n" : "Your laptop could use a little care:\n");
+        foreach (string l in c.Lines) sb.Append("\n\u2022 " + l);
+        if (c.Tips.Count > 0)
+        {
+            sb.Append("\n\nWhat I'd do:");
+            for (int i = 0; i < c.Tips.Count; i++) sb.Append("\n" + (i + 1) + ". " + c.Tips[i]);
+        }
+        chat.AddMessage("Monkey", sb.ToString());
+        if (c.Links.Count > 0) chat.AddLinks("Open it yourself (nothing changes until you do):", c.Links);
+        chat.AddNote("I only looked: nothing was changed, deleted or sent anywhere.");
+        grinTime = c.Problems == 0 ? 1.5 : 0;
+        Say(c.Problems == 0 ? "All good! Healthy laptop!" : c.Problems <= 2 ? "Pretty good! A couple of tips in the chat." : "Some things need care. Tips in the chat!", true, 4);
+    }
+
+    // Now and then: a warning when the main drive is nearly full (once a day).
+    void UpdateCheckup(double now)
+    {
+        if (now < nextDiskCheck) return;
+        nextDiskCheck = now + 30 * 60;
+        if (Resting || userAway || lowDiskWarned == DateTime.Today) return;
+        try
+        {
+            var d = new System.IO.DriveInfo(System.IO.Path.GetPathRoot(Environment.SystemDirectory));
+            double share = (double)d.AvailableFreeSpace / d.TotalSize;
+            if (share < 0.08)
+            {
+                lowDiskWarned = DateTime.Today;
+                Say("Your " + d.Name.TrimEnd('\\') + " drive is almost full (" + Gb(d.AvailableFreeSpace) + " left)! Ask me \"check my laptop\" for help.", false, 6);
+            }
+        }
+        catch { }
+    }
+
+    // ---- Battery health ----
+    // How worn the battery is and how to look after it, from Windows' own battery report (powercfg), read on this PC.
+    // Some laptops (HP among them) quietly lower the "design capacity" they report as the battery wears, so the
+    // original is taken as the most the battery ever held, from the report's week-by-week history.
+    // Nothing here is sent anywhere (only if you ask Monkey about your battery in the chat, a one-line summary goes with it).
+
+    sealed class BatteryReport
+    {
+        public int Original, Full, Cycles;                  // mWh, and charge cycles (0 = not reported)
+        public DateTime Since = DateTime.MinValue;          // when this battery's history starts
+        public double HoursThen, HoursNow;                  // how long a full charge lasted in use, new and now
+        public double PluggedShare = -1;                    // share of the last month spent plugged in
+        public string Maker = "";
+        public DateTime At;
+        public int Health { get { return Original > 0 ? (int)Math.Round(100.0 * Full / Original) : 0; } }
+    }
+    static volatile BatteryReport battery;
+    static int batteryLoading;
+    bool batteryTips = true;
+    bool lowWarned, veryLowWarned;
+    double pluggedFullSince = -1, nextBatteryCheck = 20;
+    DateTime fullTipDay;
+
+    static bool HasBattery { get { return (SystemInformation.PowerStatus.BatteryChargeStatus & BatteryChargeStatus.NoSystemBattery) == 0; } }
+
+    // Reads the report in the background at idle priority (it takes Windows several seconds).
+    static void WarmBattery()
+    {
+        if (!HasBattery || Interlocked.Exchange(ref batteryLoading, 1) == 1) return;
+        var t = new Thread(() =>
+        {
+            try { var r = ReadBatteryReport(); if (r != null) battery = r; }
+            catch { }
+            finally { batteryLoading = 0; }
+        });
+        t.IsBackground = true;
+        t.Priority = ThreadPriority.Lowest;
+        t.Start();
+    }
+
+    static BatteryReport ReadBatteryReport()
+    {
+        string file = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey-battery-" + Guid.NewGuid().ToString("N") + ".xml");
+        try
+        {
+            var psi = new ProcessStartInfo("powercfg.exe", "/batteryreport /xml /output \"" + file + "\"")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            using (var p = Process.Start(psi))
+            {
+                try { p.PriorityClass = ProcessPriorityClass.Idle; } catch { }
+                p.StandardOutput.ReadToEnd();
+                if (!p.WaitForExit(60000)) { try { p.Kill(); } catch { } return null; }
+            }
+            if (!System.IO.File.Exists(file)) return null;
+            var doc = new System.Xml.XmlDocument();
+            doc.Load(file);
+            Func<System.Xml.XmlNode, string, string> child = (n, name) =>
+            {
+                foreach (System.Xml.XmlNode c in n.ChildNodes) if (c.LocalName == name) return c.InnerText;
+                return "";
+            };
+            Func<System.Xml.XmlNode, string, int> num = (n, name) =>
+            {
+                var a = n.Attributes != null ? n.Attributes[name] : null;
+                int v; return int.TryParse(a != null ? a.Value : child(n, name), out v) ? v : 0;
+            };
+            Func<System.Xml.XmlNode, string, double> hours = (n, name) =>
+            {
+                var a = n.Attributes != null ? n.Attributes[name] : null;
+                try { return a == null ? 0 : System.Xml.XmlConvert.ToTimeSpan(a.Value).TotalHours; } catch { return 0; }
+            };
+            Func<System.Xml.XmlNode, string, DateTime> date = (n, name) =>
+            {
+                var a = n.Attributes != null ? n.Attributes[name] : null;
+                DateTime d; return a != null && DateTime.TryParse(a.Value, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out d) ? d : DateTime.MinValue;
+            };
+
+            var r = new BatteryReport { At = DateTime.UtcNow };
+            var batteries = doc.GetElementsByTagName("Battery");
+            if (batteries.Count == 0) return null;
+            var b = batteries[0];
+            r.Full = num(b, "FullChargeCapacity");
+            r.Original = Math.Max(num(b, "DesignCapacity"), r.Full);
+            r.Cycles = num(b, "CycleCount");
+            foreach (System.Xml.XmlNode n in doc.GetElementsByTagName("SystemManufacturer")) r.Maker = n.InnerText.Trim();
+
+            // History since this battery went in (a replaced battery starts afresh).
+            var all = doc.GetElementsByTagName("HistoryEntry").Cast<System.Xml.XmlNode>().ToList();
+            int first = 0;
+            for (int i = 0; i < all.Count; i++) if (num(all[i], "BatteryChanged") == 1) first = i;
+            var history = all.Skip(first).ToList();
+            if (history.Count > 0)
+            {
+                r.Since = date(history[0], "StartDate");
+                var best = history.OrderByDescending(h => Math.Max(num(h, "FullChargeCapacity"), num(h, "DesignCapacity"))).First();
+                r.Original = Math.Max(r.Original, Math.Max(num(best, "FullChargeCapacity"), num(best, "DesignCapacity")));
+                r.HoursThen = hours(best, "EstimatedFullChargeActiveTime");
+                r.HoursNow = hours(history[history.Count - 1], "EstimatedFullChargeActiveTime");
+                if (r.Cycles == 0) r.Cycles = history.Max(h => num(h, "CycleCount"));
+                double ac = 0, dc = 0;
+                foreach (var h in history.Where(h => date(h, "StartDate") > DateTime.UtcNow.AddDays(-31)))
+                {
+                    ac += hours(h, "ActiveAcTime") + hours(h, "CsAcTime");
+                    dc += hours(h, "ActiveDcTime") + hours(h, "CsDcTime");
+                }
+                if (ac + dc > 5) r.PluggedShare = ac / (ac + dc);
+            }
+            return r;
+        }
+        finally { try { System.IO.File.Delete(file); } catch { } }
+    }
+
+    // Where this laptop keeps its "stop charging at 80%" setting.
+    static string ChargeLimitTip(string maker)
+    {
+        string m = maker.ToUpperInvariant();
+        if (m.StartsWith("HP") || m.Contains("HEWLETT"))
+            return "Turn on HP's charge limit: in the myHP or HP Support Assistant app look for Smart Charge / Adaptive Battery Optimizer, "
+                 + "or in the BIOS (press F10 at start-up) set Battery Health Manager to \"Maximize my battery health\". It stops charging at about 80%.";
+        if (m.Contains("LENOVO")) return "Turn on Conservation Mode in Lenovo Vantage (Device > Power). It stops charging at about 60-80%.";
+        if (m.Contains("DELL")) return "In Dell Power Manager (or Dell Optimizer) set battery charging to \"Primarily AC use\". It stops charging early.";
+        if (m.Contains("ASUS")) return "In MyASUS, set Battery Health Charging to Balanced (80%) or Maximum lifespan (60%).";
+        if (m.Contains("ACER")) return "In Acer Care Center (or Acer Quick Access), turn on Battery Charge Limit (80%).";
+        if (m.Contains("MICROSOFT")) return "In the Surface app, turn on Battery Limit / Smart Charging. It stops at about 80%.";
+        if (m.Contains("SAMSUNG")) return "In Samsung Settings, turn on Protect Battery (stops at 85%).";
+        return "Check your laptop maker's app or BIOS for a battery charge limit (often called battery care or conservation mode) and set it to about 80%.";
+    }
+
+    // The full answer for the chat: how healthy it is, what that means, and what to do.
+    string BatteryAnswer(BatteryReport r)
+    {
+        var ps = SystemInformation.PowerStatus;
+        int pct = (int)Math.Round(ps.BatteryLifePercent * 100);
+        bool plugged = ps.PowerLineStatus == PowerLineStatus.Online;
+        var sb = new System.Text.StringBuilder();
+        sb.Append("Right now: " + pct + "%, " + (plugged ? (pct >= 100 ? "full and plugged in." : "charging.") : "on battery."));
+        if (r == null || r.Original <= 0) { sb.Append("\nI couldn't read the battery's health from Windows on this PC."); return sb.ToString(); }
+
+        int h = r.Health;
+        string verdict = h >= 90 ? "great" : h >= 80 ? "good" : h >= 60 ? "worn" : "weak";
+        sb.Append("\n\nBattery health: " + h + "% (" + verdict + "). It holds " + (r.Full / 1000.0).ToString("0.0") + " Wh of the "
+            + (r.Original / 1000.0).ToString("0.0") + " Wh it held when new");
+        if (r.Since > DateTime.MinValue)
+        {
+            double years = (DateTime.UtcNow - r.Since).TotalDays / 365.25;
+            sb.Append(", after " + (years >= 1 ? years.ToString("0.#") + " years" : Math.Max(1, (int)((DateTime.UtcNow - r.Since).TotalDays / 30)) + " months"));
+        }
+        sb.Append(r.Cycles > 0 ? " and " + r.Cycles + " charge cycles." : ".");
+        if (r.HoursThen > 0.5 && r.HoursNow > 0.3)
+            sb.Append(" A full charge now lasts about " + r.HoursNow.ToString("0.#") + " hours of use, down from " + r.HoursThen.ToString("0.#") + ".");
+        if (r.PluggedShare >= 0) sb.Append(" This month it was plugged in " + (int)Math.Round(r.PluggedShare * 100) + "% of the time.");
+
+        sb.Append("\n\nMy tips:");
+        int n = 0;
+        Action<string> tip = t => sb.Append("\n" + (++n) + ". " + t);
+        if (r.PluggedShare >= 0.6 || plugged)
+            tip("You keep it plugged in a lot, and sitting at 100% is what wears a battery most. " + ChargeLimitTip(r.Maker));
+        else
+            tip("When you can, unplug at about 80-90% instead of always charging to 100%. " + ChargeLimitTip(r.Maker));
+        tip("Plug in before it drops under 20%; running it down to empty often wears it faster. I'll remind you at 20%.");
+        tip("Keep it cool: use it on a hard surface with the vents clear, not on a bed or pillow. Heat ages batteries fastest.");
+        if (h < 60)
+            tip("At " + h + "% it's getting near the end. If it doesn't last long enough for you, a replacement battery"
+                + (r.Maker.Length > 0 ? " for your " + r.Maker.Split(' ')[0] : "") + " will bring back the full run time. Look up your laptop's model on the sticker underneath.");
+        else if (h < 80)
+            tip("It's normal for a battery to drop to about 80% in 2-3 years. Below about 60% most people replace it; you're not there yet.");
+        if (pct <= 25 && !plugged) tip("You're at " + pct + "% now, so plug in soon!");
+        tip("Battery Saver (Settings > System > Power & battery) makes each charge last longer when you're away from a socket.");
+        return sb.ToString();
+    }
+
+    // "How's my battery?" from the menu, or "battery" in the chat.
+    void AskBattery(bool typed, string q)
+    {
+        OpenChat();
+        if (typed) chat.AddMessage("You", q);
+        if (!HasBattery) { chat.AddNote("This PC doesn't have a battery, so there's nothing to check. Plugged in forever!"); Say("No battery here!", true); return; }
+        BatteryReport r = battery;
+        if (r != null && (DateTime.UtcNow - r.At).TotalHours < 12) { ShowBattery(r); return; }
+        chat.AddNote("Checking your battery... (Windows takes a few seconds for this)");
+        chat.SetBusy(true);
+        Say(Pick("Let me check your battery...", "Checking the juice..."), true, 10);
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            var sw = Stopwatch.StartNew();
+            while (batteryLoading == 1 && sw.Elapsed.TotalSeconds < 60) Thread.Sleep(100);   // the daily check is reading it right now
+            BatteryReport fresh = battery;
+            if (fresh == null || (DateTime.UtcNow - fresh.At).TotalHours >= 12)
+                try { var got = ReadBatteryReport(); if (got != null) battery = got; } catch { }
+            try { BeginInvoke((Action)(() => { chat.SetBusy(false); ShowBattery(battery); })); } catch { }
+        });
+    }
+
+    void ShowBattery(BatteryReport r)
+    {
+        chat.AddMessage("Monkey", BatteryAnswer(r));
+        if (r == null || r.Original <= 0) { Say("Hmm, Windows won't tell me.", true); return; }
+        int h = r.Health;
+        Say(h >= 80 ? "Battery health " + h + "%. Looking good!" : h >= 60 ? "Battery health " + h + "%. Some tips in the chat!" : "Battery health " + h + "%. It's tired! Tips in the chat.", true, 4);
+        grinTime = h >= 80 ? 1.5 : 0;
+    }
+
+    // Now and then: a reminder to plug in when it's low, and to give it a break from 100% when it's always plugged in.
+    void UpdateBattery(double now)
+    {
+        if (now < nextBatteryCheck) return;
+        nextBatteryCheck = now + 30;
+        if (!HasBattery) return;
+        if (battery == null || (DateTime.UtcNow - battery.At).TotalHours > 24) WarmBattery();   // once a day, quietly
+        var ps = SystemInformation.PowerStatus;
+        int pct = (int)Math.Round(ps.BatteryLifePercent * 100);
+        bool plugged = ps.PowerLineStatus == PowerLineStatus.Online;
+        if (plugged) { lowWarned = veryLowWarned = false; }
+        if (!batteryTips || Resting || userAway) { if (!plugged || pct < 100) pluggedFullSince = -1; return; }
+
+        if (!plugged && pct <= 10 && !veryLowWarned)
+        {
+            veryLowWarned = lowWarned = true;
+            Say("Battery at " + pct + "%! Plug in now, quick!", true, 4);
+            grinTime = 0;
+        }
+        else if (!plugged && pct <= 20 && !lowWarned)
+        {
+            lowWarned = true;
+            Say(Pick("Battery's at " + pct + "%. Time to plug in?", "Only " + pct + "% left. Charger time!"), true, 4);
+        }
+
+        // Full and still plugged in for a good while: one gentle nudge a day.
+        if (plugged && pct >= 100) { if (pluggedFullSince < 0) pluggedFullSince = now; }
+        else pluggedFullSince = -1;
+        if (pluggedFullSince >= 0 && now - pluggedFullSince > 90 * 60 && fullTipDay != DateTime.Today && mode == Mode.Home && sleepW < 0.5f)
+        {
+            fullTipDay = DateTime.Today;
+            BatteryReport r = battery;
+            string health = r != null && r.Original > 0 && r.Health < 90 ? " (it's at " + r.Health + "% health)" : "";
+            Say("Battery's full and still plugged in. Unplugging now and then helps it last" + health + ". Ask me \"battery\" for tips!", false, 6);
+        }
     }
 
     // ---- Hourly chime ----
@@ -805,6 +1428,8 @@ public class Monkey : Form
                 else if (key == "weather" && bool.TryParse(val, out b)) weatherOn = b;
                 else if (key == "chime" && bool.TryParse(val, out b)) chimeOn = b;
                 else if (key == "findWholePC" && bool.TryParse(val, out b)) findWholePC = b;
+                else if (key == "batteryTips" && bool.TryParse(val, out b)) batteryTips = b;
+                else if (key == "chatKeepDays" && int.TryParse(val, out n) && n >= -1) chatKeepDays = n;
                 else if (key == "privateFolders") privateFolders = val.Split('|').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
                 else if (key == "weatherAt") weatherAt = val;
                 else if (key == "weatherPlace") { LoadPlace(val); savedPlace = val; }
@@ -832,6 +1457,8 @@ public class Monkey : Form
                 "weather=" + weatherOn,
                 "chime=" + chimeOn,
                 "findWholePC=" + findWholePC,
+                "batteryTips=" + batteryTips,
+                "chatKeepDays=" + chatKeepDays,
                 "privateFolders=" + string.Join("|", privateFolders),
                 "weatherAt=" + weatherAt,
                 "weatherPlace=" + (savedPlace = PlaceSetting()),
@@ -1341,6 +1968,7 @@ public class Monkey : Form
         menu.Items.Add("Ask Monkey... (double-click me)", null, (s, e) => OpenChat());
         menu.Items.Add(BrainMenu());
         menu.Items.Add(FindMenu());
+        menu.Items.Add(ChatHistoryMenu());
         menu.Items.Add(new ToolStripSeparator());
         var pullItem = new ToolStripMenuItem("Monkey opens my tabs") { Checked = pullTabs, CheckOnClick = true };
         pullItem.CheckedChanged += (s, e) => { pullTabs = pullItem.Checked; SaveSettings(); };
@@ -1353,6 +1981,11 @@ public class Monkey : Form
         menu.Items.Add(IntervalMenu("Eye break every", EyesChoices, () => eyesEvery,
             v => { eyesEvery = v; nextEyes = clock.Elapsed.TotalSeconds + v; }));
         menu.Items.Add("What's the weather?", null, (s, e) => AskWeather());
+        menu.Items.Add("Laptop check-up", null, (s, e) => AskCheckup(false, null));
+        menu.Items.Add("How's my battery?", null, (s, e) => AskBattery(false, null));
+        var batteryItem = new ToolStripMenuItem("Battery tips && reminders") { Checked = batteryTips, CheckOnClick = true };
+        batteryItem.CheckedChanged += (s, e) => { batteryTips = batteryItem.Checked; SaveSettings(); };
+        menu.Items.Add(batteryItem);
         var weatherItem = new ToolStripMenuItem("Weather forecasts") { Checked = weatherOn, CheckOnClick = true };
         weatherItem.CheckedChanged += (s, e) => { weatherOn = weatherItem.Checked; SaveSettings(); if (weatherOn) nextWeatherFetch = 0; };
         menu.Items.Add(weatherItem);
@@ -1375,6 +2008,7 @@ public class Monkey : Form
         hideItem = new ToolStripMenuItem("Hide monkey (hold M)");
         hideItem.Click += (s, e) => ToggleHidden();
         menu.Items.Add(hideItem);
+        menu.Items.Add("About Monkey Play", null, (s, e) => ShowAbout());
         menu.Items.Add("Quit monkey", null, (s, e) => Close());
         Shown += (s, e) => { ApplyVisibility(); CheckStartWithWindows(startItem); };   // starts hidden if it was put away last time
         MouseDown += OnDown;
@@ -1640,7 +2274,25 @@ public class Monkey : Form
     internal static readonly string ChatDir = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"MonkeyPlay\chat");
 
+    internal const string Creator = "Binu Madhavan";
+    internal const string HomePage = "https://github.com/binumadhavan2-prog/monkey-play";
+
+    // Right-click > About: who made it.
+    void ShowAbout()
+    {
+        Say(Pick(Creator + " made me!", "I'm " + Creator + "'s monkey!", "Built with love by " + Creator + "!"), true, 3);
+        grinTime = 2;
+        var r = MessageBox.Show("Monkey Play " + Application.ProductVersion.Substring(0, 3) + "\n\n"
+            + "Created by " + Creator + "\n"
+            + "Copyright © 2026 " + Creator + ". All rights reserved.\n\n"
+            + HomePage.Replace("https://", "") + "\n\nOpen the project page?",
+            "About Monkey Play", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+        if (r == DialogResult.Yes) try { Process.Start(HomePage); } catch { }
+    }
+
     internal const string Persona =
+        "You were created by " + Creator + ", who designed and built you (the Monkey Play app). If anyone asks who made, " +
+        "created, built or owns you, say " + Creator + " made you, warmly and proudly. " +
         "You are Monkey, a friendly cartoon monkey in sunglasses (the user may call them coolers, shades or glasses) " +
         "and a teal puffer jacket who lives on the user's " +
         "Windows desktop, hanging from a branch, and helps them out. You have no tools and no access to their " +
@@ -1673,6 +2325,7 @@ public class Monkey : Form
             {
                 chatSession = null;
                 if (link != null && !asking) link.Stop();
+                if (chatKeepDays == 0) ThreadPool.QueueUserWorkItem(_ => { Thread.Sleep(1500); CleanSavedChats(0, true, chatSession); });
                 EnsureLink();   // a fresh conversation, already warming up
                 Say(Pick("Fresh start!", "New chat, who dis?", "Clean slate!"), true);
             };
@@ -1687,6 +2340,7 @@ public class Monkey : Form
         EnsureLink();   // start Claude Code now, so the first answer is quick too
         WarmApps();
         if (findWholePC) WarmDisk();
+        WarmIndexDirs();
         if (chatSession == null && chat.IsEmpty) Say(Pick("Ask me anything!", "What's up?", "Hi! How can I help?"), true);
     }
 
@@ -1714,11 +2368,15 @@ public class Monkey : Form
         lastChatUse = clock.Elapsed.TotalSeconds;
     }
 
-    void Ask(string question, bool useClip, string file)
+    void Ask(string question, bool useClip, string file, bool noCommands = false)
     {
         if (asking || string.IsNullOrWhiteSpace(question)) return;
         // "find ..." and "open ..." are done here on the PC; they never go to Claude.
-        if (!useClip && file == null && FileCommand(question.Trim())) return;
+        if (!noCommands && !useClip && file == null && Regex.IsMatch(question.Trim(), @"^(?:(?:check|show|how'?s|how is|what'?s|whats)\s+)?(?:my\s+|the\s+)?battery(?:\s+(?:health|life|status|condition|report|check))?\s*[?.!]*$", RegexOptions.IgnoreCase))
+        { AskBattery(true, question.Trim()); return; }
+        if (!noCommands && !useClip && file == null && Regex.IsMatch(question.Trim(), @"^(?:please\s+)?(?:(?:check|scan|test|examine)(?:\s+up)?\s+(?:my\s+|the\s+|this\s+)?(?:laptop|pc|computer|system|machine)(?:'?s)?(?:\s+(?:health|condition))?|(?:laptop|pc|computer|system)\s+(?:check-?up|health(?:\s+check)?|condition)|check-?up|health\s*check|how'?s\s+my\s+(?:laptop|pc|computer)(?:\s+doing)?)\s*[?.!]*$", RegexOptions.IgnoreCase))
+        { AskCheckup(true, question.Trim()); return; }
+        if (!noCommands && !useClip && file == null && FileCommand(question.Trim())) return;
         string prompt = question.Trim();
         if (file != null)
         {
@@ -1741,6 +2399,20 @@ public class Monkey : Form
         Forecast wf = weather;
         if (wf != null && Regex.IsMatch(question, @"weather|rain|umbrella|sunny|snow|storm|forecast|temperature|\bhot\b|\bcold\b|tomorrow", RegexOptions.IgnoreCase))
             prompt += "\n\n(Live forecast where I am, from Open-Meteo: " + wf.Summary() + ")";
+        Checkup ck = checkup;
+        if (ck != null && (DateTime.Now - ck.At).TotalHours < 6
+            && Regex.IsMatch(question, @"\b(slow|lag|hang|laptop|computer|pc|storage|space|disk|ssd|memory|ram|update|virus|antivirus|startup|restart|fast(er)?)\b", RegexOptions.IgnoreCase))
+            prompt += "\n\n(My laptop's last check-up, from the monkey app: " + ck.Brief + ")";
+        BatteryReport br = battery;
+        if (Regex.IsMatch(question, @"batter|charg", RegexOptions.IgnoreCase) && HasBattery)
+        {
+            var ps = SystemInformation.PowerStatus;
+            prompt += "\n\n(My laptop's battery, from Windows: now " + (int)Math.Round(ps.BatteryLifePercent * 100) + "%, "
+                + (ps.PowerLineStatus == PowerLineStatus.Online ? "plugged in" : "on battery")
+                + (br != null && br.Original > 0 ? ", health " + br.Health + "% (" + br.Full + " of " + br.Original + " mWh)"
+                    + (br.PluggedShare >= 0 ? ", plugged in " + (int)Math.Round(br.PluggedShare * 100) + "% of the time this month" : "")
+                    + (br.Maker.Length > 0 ? ", made by " + br.Maker : "") : "") + ")";
+        }
         prompt += "\n\n(It's " + DateTime.Now.ToString("dddd d MMMM yyyy, h:mm tt", System.Globalization.CultureInfo.InvariantCulture) + " here.)";
         chat.AddMessage("You", question.Trim());
         EnsureLink();
@@ -1766,16 +2438,36 @@ public class Monkey : Form
     static readonly HashSet<string> Filler = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
         "my", "the", "a", "an", "file", "files", "document", "documents", "doc", "named", "called", "with", "for", "of", "on",
         "in", "me", "please", "that", "this", "some", "any", "all", "from", "pc", "computer", "laptop" };
+    // Filler for files, but a folder can be named with them.
+    static readonly HashSet<string> NameNouns = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "file", "files", "document", "documents", "doc", "docs" };
     static readonly HashSet<string> FolderWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
         "folder", "folders", "directory", "directories", "dir" };
 
-    bool FileCommand(string q)
+    // Words people put in front of a request: "i said find...", "can you please find...", "monkey, open...".
+    static readonly Regex LeadIn = new Regex(@"^(?:(?:hey|hi|hello|ok|okay|oh|no|so|and|now|again|just|please|pls|plz|monkey|bro|dude|i\s+said|i\s+told\s+you|i\s+mean|"
+        + @"can\s+you|could\s+you|will\s+you|would\s+you|you\s+can|help\s+me|i\s+want\s+(?:you\s+)?to|i\s+need\s+(?:you\s+)?to|i\s+wanna|let'?s|try\s+to|go\s+and)\b[\s,.!]*)+",
+        RegexOptions.IgnoreCase);
+    // "...in C", "...on D drive", "...in the c: folder"
+    static readonly Regex DriveAtEnd = new Regex(@"\s+(?:in|on|inside|from|at)\s+(?:the\s+|my\s+)?([a-z])(?:\s*:|\s+drive|\s+folder|\s+disk|\s+partition)*\s*$", RegexOptions.IgnoreCase);
+    // A follow-up that only says where: "its c folder", "it's in C drive", "in D:", "c drive"
+    static readonly Regex DriveOnly = new Regex(@"^(?:(?:it'?s|its|it\s+is|that'?s|look|search|check|try)\s+)?(?:(?:in|on|inside)\s+)?(?:the\s+|my\s+)?([a-z])(?:\s*:|\s+drive|\s+folder|\s+disk|\s+partition)+\s*[.!]*$"
+        + @"|^(?:it'?s|its|it\s+is)\s+(?:in|on)\s+(?:the\s+)?([a-z])\s*[.!]*$", RegexOptions.IgnoreCase);
+    // "birthday folder", "my neema folder"
+    static readonly Regex BareFolder = new Regex(@"^(?:my\s+|the\s+)?(\S+(?:\s+\S+){0,4}?)\s+(?:folder|directory)\s*[?.!]*$", RegexOptions.IgnoreCase);
+    // "find" somewhere inside a longer sentence: tried here, and only if something turns up is it a search.
+    static readonly Regex FindInside = new Regex(@"\b(find|search(?:\s+for)?|look\s+for|locate|where\s+is|where'?s)\s+(.+?)[\s?.!]*$", RegexOptions.IgnoreCase);
+
+    string lastSearchWhat, lastSearchVerb;
+
+    bool FileCommand(string said)
     {
+        string q = LeadIn.Replace(said.Trim(), "").Trim();
         Match m = OpenNumber.Match(q);
         if (m.Success && lastListedApps && lastApps.Count > 0)
         {
             int n = int.Parse(m.Groups[1].Value);
-            chat.AddMessage("You", q);
+            chat.AddMessage("You", said);
             if (n >= 1 && n <= lastApps.Count) { OpenApp(lastApps[n - 1]); chat.AddNote("Opening " + lastApps[n - 1].Name + "..."); }
             else chat.AddNote("There's no number " + n + " in the list.");
             return true;
@@ -1783,20 +2475,42 @@ public class Monkey : Form
         if (m.Success && lastFound.Count > 0)
         {
             int n = int.Parse(m.Groups[1].Value);
-            chat.AddMessage("You", q);
+            chat.AddMessage("You", said);
             if (n >= 1 && n <= lastFound.Count) { OpenFile(lastFound[n - 1], false); chat.AddNote("Opening " + System.IO.Path.GetFileName(lastFound[n - 1].TrimEnd('\\')) + "..."); }
             else chat.AddNote("There's no number " + n + " in the list.");
             return true;
         }
+
+        // "its c folder" after a search: the same search, on that drive.
+        m = DriveOnly.Match(q);
+        if (m.Success && lastSearchWhat != null)
+        {
+            string letter = (m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value).ToUpperInvariant();
+            return RunSearch(said, "find", lastSearchWhat, letter, false);
+        }
+
+        bool soft = false;
+        string verb, what;
         m = FindCmd.Match(q);
-        if (!m.Success) return false;
-        string verb = m.Groups[1].Value.ToLowerInvariant(), what = m.Groups[2].Value.Trim();
+        if (m.Success) { verb = m.Groups[1].Value.ToLowerInvariant(); what = m.Groups[2].Value.Trim(); }
+        else if ((m = BareFolder.Match(q)).Success && !Regex.IsMatch(m.Groups[1].Value, @"^(?:a|new|this|that|which|what|how|why|create|make|delete|rename)\b", RegexOptions.IgnoreCase))
+        { verb = "find"; what = m.Groups[1].Value + " folder"; soft = true; }
+        else if ((m = FindInside.Match(q)).Success) { verb = "find"; what = m.Groups[2].Value.Trim(); soft = true; }
+        else return false;
+        if (verb.StartsWith("where")) verb = "find";
+        // "find me a good recipe...", "find out how...": probably a question, so only a search if something turns up.
+        if (verb == "find" && Regex.IsMatch(what, @"^(?:me\s+(?:a|an|some|the)|out|a\s+way|ways?\s+to|how|why|what|when|who|the\s+best)", RegexOptions.IgnoreCase)) soft = true;
+
+        // "...in C" / "...on D drive": only that drive.
+        string drive = null;
+        Match dm = DriveAtEnd.Match(what);
+        if (dm.Success && what.Length > dm.Length) { drive = dm.Groups[1].Value.ToUpperInvariant(); what = what.Substring(0, dm.Index).Trim(); }
 
         // "open downloads", "open my documents folder", "open file explorer"...
         string known = KnownFolder(what);
         if (known != null && verb == "open")
         {
-            chat.AddMessage("You", q);
+            chat.AddMessage("You", said);
             OpenFile(known, false);
             chat.AddNote("Opening " + (known.Length == 0 ? "File Explorer" : System.IO.Path.GetFileName(known)) + "...");
             Say(Pick("Here you go!", "Opening it!", "Ta-da!"), true);
@@ -1809,7 +2523,7 @@ public class Monkey : Form
             List<App> apps = AppMatches(what);
             if (apps.Count > 0)
             {
-                chat.AddMessage("You", q);
+                chat.AddMessage("You", said);
                 if (apps.Count == 1)
                 {
                     OpenApp(apps[0]);
@@ -1826,14 +2540,24 @@ public class Monkey : Form
             }
             if (verb != "open") return false;   // not an app: let Monkey answer
         }
+        return RunSearch(said, verb, what, drive, soft);
+    }
 
+    // Looks for files and folders. 'soft': the request was only part of a sentence, so if nothing turns up,
+    // the whole message goes to Monkey as a question instead.
+    bool RunSearch(string said, string verb, string what, string drive, bool soft)
+    {
         var exts = new List<string>();
         var words = new List<string>();
+        var kinds = new List<string>();
         bool foldersOnly;
-        ParseSearch(what, words, exts, out foldersOnly);
+        ParseSearch(what, words, exts, kinds, out foldersOnly);
         if (words.Count == 0 && exts.Count == 0) return false;   // nothing to look for: let Monkey answer
+        var dirWords = FolderWordsOf(what, words, kinds);
+        if (words.Count + kinds.Count >= 4) soft = true;   // a long sentence: a search only if something turns up
+        lastSearchWhat = what; lastSearchVerb = verb;
 
-        chat.AddMessage("You", q);
+        if (!soft) chat.AddMessage("You", said);
         chat.SetBusy(true);
         Say(Pick("Let me look...", "Searching my branches...", "Hmm, where did you put it..."), true, 10);
         bool wholePc = findWholePC;
@@ -1841,24 +2565,33 @@ public class Monkey : Form
         var found = new List<string>();
         ThreadPool.QueueUserWorkItem(_ =>
         {
-            try { found = SearchFiles(words, exts, foldersOnly, 15, wholePc, privates); } catch { }
+            try { found = SearchFiles(words, dirWords, exts, foldersOnly, 15, wholePc, privates, drive); } catch { }
             try
             {
                 BeginInvoke((Action)(() =>
                 {
                     chat.SetBusy(false);
-                    string label = string.Join(" ", words) + (exts.Count > 0 ? (words.Count > 0 ? " " : "") + "(" + string.Join(", ", exts.Distinct()) + ")" : "");
+                    if (found.Count == 0 && soft) { Ask(said, false, null, true); return; }   // wasn't a search after all
+                    if (soft) chat.AddMessage("You", said);
+                    string label = string.Join(" ", dirWords.Count > 0 ? dirWords : words) + (exts.Count > 0 && kinds.Count == 0 ? (words.Count > 0 ? " " : "") + "(" + string.Join(", ", exts.Distinct()) + ")" : "")
+                        + (drive != null ? " on " + drive + ":" : "");
                     if (found.Count == 0)
                     {
-                        chat.AddNote("I couldn't find any " + (foldersOnly ? "folder" : "file or folder") + " matching \"" + label + "\". Try fewer or different words, or part of the name.");
+                        chat.AddNote("I couldn't find any " + (foldersOnly ? "folder" : "file or folder") + " matching \"" + label + "\". Try fewer words, or just part of the name"
+                            + " (like \"find birth\"). I match the start of each word, so check the spelling too.");
                         Say(Pick("Couldn't find it!", "No luck, sorry!"), true);
                         return;
                     }
                     lastFound = found; lastListedApps = false;
-                    chat.AddFiles((found.Count == 1 ? "Found 1 match" : "Found " + found.Count + " matches") + " for \"" + label
-                        + "\" (folders first, then newest files). Click a name to open it, or type \"open 1\":", found);
+                    var by = dirWords.Count > 0 ? dirWords : words;
+                    bool near = by.Count > 0 && !found.Any(p => StartsWords(System.IO.Path.GetFileName(p.TrimEnd('\\')), by) || NameIs(p, by));
+                    if (near)
+                        chat.AddFiles("Nothing is called exactly \"" + label + "\", but these are spelled nearly the same. Click one to open it, or type \"open 1\":", found);
+                    else
+                        chat.AddFiles((found.Count == 1 ? "Found 1 match" : "Found " + found.Count + " matches") + " for \"" + label
+                            + "\" (folders first, then newest files). Click a name to open it, or type \"open 1\":", found);
                     // "open neema" opens the folder called just that; otherwise only a single match opens by itself.
-                    if (verb == "open" && (found.Count == 1 || (System.IO.Directory.Exists(found[0]) && NameIs(found[0], words))))
+                    if (verb == "open" && (found.Count == 1 || (System.IO.Directory.Exists(found[0]) && NameIs(found[0], dirWords))))
                     { OpenFile(found[0], false); chat.AddNote("Opening " + System.IO.Path.GetFileName(found[0].TrimEnd('\\')) + "..."); }
                     Say(Pick("Found it!", "Here's what I found!", "Got some!"), true);
                 }));
@@ -2039,20 +2772,33 @@ public class Monkey : Form
 
     // The words to look for, a file type if one was named ("my GST pdf", "excel sheet"), and whether only
     // folders are wanted ("find neema folder").
-    static void ParseSearch(string what, List<string> words, List<string> exts, out bool foldersOnly)
+    // 'kinds' are words that name a kind of file ("images", "pdf", "screenshots"): they pick the file type for
+    // files, but a folder can be called that too ("WhatsApp Images", "Screenshots"), so folders are matched on them.
+    static void ParseSearch(string what, List<string> words, List<string> exts, List<string> kinds, out bool foldersOnly)
     {
         foldersOnly = false;
         foreach (string raw in Regex.Split(what, @"[\s,]+"))
         {
             string w = Regex.Replace(raw, @"[^\w.\-]", "").Trim('.');
-            if (w.Length == 0 || Filler.Contains(w)) continue;
+            if (w.Length == 0 || !Regex.IsMatch(w, @"[\p{L}\p{N}]")) continue;   // "-" on its own isn't a word
+            if (NameNouns.Contains(w)) { kinds.Add(w); continue; }                   // "WhatsApp Documents"
+            if (Filler.Contains(w)) continue;
             if (FolderWords.Contains(w)) { foldersOnly = true; continue; }
             string[] kind = KindExtensions(w);
-            if (kind != null) { exts.AddRange(kind); continue; }
+            if (kind != null) { exts.AddRange(kind); kinds.Add(w); continue; }
             if (Regex.IsMatch(w, @"^\.?[a-z0-9]{2,5}$", RegexOptions.IgnoreCase) && raw.StartsWith(".")) { exts.Add("." + w.TrimStart('.').ToLowerInvariant()); continue; }
             words.Add(w);
         }
-        if (exts.Count > 0) foldersOnly = false;   // "pdf folder" means pdfs
+        if (foldersOnly && kinds.Count == 0 && exts.Count > 0) foldersOnly = false;   // ".pdf folder" means pdfs
+        if (words.Count == 0 && exts.Count == 0 && kinds.Count > 0) words.AddRange(kinds.Where(NameNouns.Contains));   // "find documents"
+    }
+
+    // The words a folder's name is matched on: everything typed, kinds of file included, in the order typed.
+    static List<string> FolderWordsOf(string what, List<string> words, List<string> kinds)
+    {
+        var all = new HashSet<string>(words.Concat(kinds), StringComparer.OrdinalIgnoreCase);
+        return Regex.Split(what, @"[\s,]+").Select(raw => Regex.Replace(raw, @"[^\w.\-]", "").Trim('.'))
+            .Where(w => all.Contains(w)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     // Is the file or folder called just these words? ("neema" is "neema", not "neema new"; "monkey play" is "Monkey_Play")
@@ -2060,30 +2806,55 @@ public class Monkey : Form
     {
         string name = System.IO.Path.GetFileName(path.TrimEnd('\\'));
         if (!System.IO.Directory.Exists(path)) name = System.IO.Path.GetFileNameWithoutExtension(name);
-        return words.Count > 0 && string.Equals(Regex.Replace(name, @"[\s_.\-]+", " ").Trim(), string.Join(" ", words), StringComparison.OrdinalIgnoreCase);
+        Func<string, string> plain = t => Regex.Replace(t, @"[^\p{L}\p{N}]+", " ").Trim();
+        return words.Count > 0 && string.Equals(plain(name), plain(string.Join(" ", words)), StringComparison.OrdinalIgnoreCase);
     }
 
     // Folders first (the one called exactly that, then the least deeply buried, and not the folders inside
     // another match), then files whose names have the words, newest first, then files that only have them inside.
     // Word-start matches come from the index directly, so a search takes a few hundredths of a second.
-    static List<string> SearchFiles(List<string> words, List<string> exts, bool foldersOnly, int max, bool wholePc, List<string> privates)
+    static List<string> SearchFiles(List<string> words, List<string> dirWords, List<string> exts, bool foldersOnly, int max, bool wholePc, List<string> privates, string drive = null)
     {
         var dirs = new List<string>();
         var files = new List<string>();
         var inside = new List<string>();
-        if (!SearchIndex(words, exts, foldersOnly, max, dirs, files, inside)) SearchHome(words, exts, foldersOnly, dirs, files);
-        if (wholePc) SearchDisk(words, exts, foldersOnly, dirs, files);
-        return Rank(dirs, files, inside, words, foldersOnly, max, privates);
+        if (!SearchIndex(words, dirWords, exts, foldersOnly, max, dirs, files, inside)) SearchHome(words, dirWords, exts, foldersOnly, dirs, files);
+        if (wholePc) SearchDisk(words, dirWords, exts, foldersOnly, dirs, files);
+        var plainWords = dirWords.Where(w => !NameNouns.Contains(w)).ToList();
+        if (dirs.Count == 0 && plainWords.Count > 0 && plainWords.Count < dirWords.Count)
+        {
+            var none = new List<string>();
+            if (!SearchIndex(plainWords, plainWords, exts, true, max, dirs, none, none)) SearchHome(plainWords, plainWords, exts, true, dirs, none);
+            if (wholePc) SearchDisk(plainWords, plainWords, exts, true, dirs, none);
+            if (dirs.Count > 0) dirWords = plainWords;
+        }
+        // Still nothing: the last word is the folder, the others a folder it's in ("find vegefoods js").
+        if (dirs.Count == 0 && dirWords.Count >= 2)
+        {
+            var name = new List<string> { dirWords[dirWords.Count - 1] };
+            var within = dirWords.Take(dirWords.Count - 1).ToList();
+            SearchDirsWithin(name, within, wholePc, dirs);
+            if (dirs.Count > 0) dirWords = name;
+        }
+        if (dirs.Count == 0 && files.Count == 0 && dirWords.Count > 0) dirs.AddRange(NearlyNamed(dirWords, wholePc));
+        if (drive != null)
+        {
+            Predicate<string> elsewhere = p => !p.StartsWith(drive + ":\\", StringComparison.OrdinalIgnoreCase);
+            dirs.RemoveAll(elsewhere); files.RemoveAll(elsewhere); inside.RemoveAll(elsewhere);
+        }
+        return Rank(dirs, files, inside, words, dirWords, foldersOnly, max, privates);
     }
 
     // The Windows Search index: your user folders, instantly. False if Windows Search isn't there.
-    static bool SearchIndex(List<string> words, List<string> exts, bool foldersOnly, int max, List<string> dirs, List<string> files, List<string> inside)
+    static bool SearchIndex(List<string> words, List<string> dirWords, List<string> exts, bool foldersOnly, int max, List<string> dirs, List<string> files, List<string> inside)
     {
         string skip = string.Join(" AND ", SkipDirs.Select(d => "System.ItemPathDisplay NOT LIKE '%" + d + "%'"));
         string extSql = exts.Count == 0 ? "" : " AND (" + string.Join(" OR ", exts.Distinct().Select(e => "System.FileExtension = '" + e + "'")) + ")";
-        Func<string, string> clean = w => Regex.Replace(w, "[\"'*%()]", "");
-        string byWords = string.Join("", words.Select(w => " AND CONTAINS(System.FileName, '\"" + clean(w) + "*\"')"));
+        Func<string, string> clean = w => Regex.Replace(w, "[\"'*%()\\[\\]]", "");
+        string byWords = IndexWords("System.FileName", words);
         string inWords = string.Join("", words.Select(w => " AND System.FileName LIKE '%" + clean(w) + "%'"));
+        string dirByWords = IndexWords("System.FileName", dirWords);
+        string dirInWords = string.Join("", dirWords.Select(w => " AND System.FileName LIKE '%" + clean(w) + "%'"));
         try
         {
             using (var c = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
@@ -2091,32 +2862,32 @@ public class Monkey : Form
                 c.Open();
                 Action<string, int, List<string>> run = (cond, top, into) =>
                 {
-                    string sql = "SELECT TOP " + top + " System.ItemPathDisplay FROM SystemIndex WHERE " + skip + cond + " ORDER BY System.DateModified DESC";
+                    string sql = "SELECT TOP " + top + " System.ItemUrl FROM SystemIndex WHERE " + skip + cond + " ORDER BY System.DateModified DESC";
                     using (var cmd = new System.Data.OleDb.OleDbCommand(sql, c))
                     using (var r = cmd.ExecuteReader())
-                        while (r.Read()) { string p = r[0] as string; if (p != null) into.Add(p); }
+                        while (r.Read()) { string p = RealPath(r[0] as string); if (p != null) into.Add(p); }
                 };
                 const string isDir = " AND System.ItemType = 'Directory'", notDir = " AND System.ItemType <> 'Directory'";
-                if (words.Count > 0 && exts.Count == 0) run(isDir + byWords, 100, dirs);
+                if (dirWords.Count > 0) run(isDir + dirByWords, 100, dirs);
                 if (!foldersOnly) run(notDir + extSql + byWords, 100, files);
                 // Nothing by whole words: try the words in the middle of names too ("shopping" in "bigmartshopping").
-                if (words.Count > 0 && dirs.Count + files.Count == 0)
+                if (dirWords.Count == 1 && dirs.Count + files.Count == 0)
                 {
-                    if (exts.Count == 0) run(isDir + inWords, 100, dirs);
-                    if (!foldersOnly) run(notDir + extSql + inWords, 100, files);
+                    run(isDir + dirInWords, 100, dirs);
+                    if (!foldersOnly && words.Count == 1) run(notDir + extSql + inWords, 100, files);
                 }
                 if (!foldersOnly && words.Count > 0 && files.Count < max)
                 {
                     // Searching inside files with the skip list is slow (a second or more), so take extra and skip them here.
-                    string sql = "SELECT TOP " + max * 4 + " System.ItemPathDisplay FROM SystemIndex WHERE System.ItemType <> 'Directory'" + extSql
-                        + string.Join("", words.Select(w => " AND CONTAINS(*, '\"" + clean(w) + "*\"')")) + " ORDER BY System.DateModified DESC";
+                    string sql = "SELECT TOP " + max * 4 + " System.ItemUrl FROM SystemIndex WHERE System.ItemType <> 'Directory'" + extSql
+                        + IndexWords("*", words) + " ORDER BY System.DateModified DESC";
                     try
                     {
                         using (var cmd = new System.Data.OleDb.OleDbCommand(sql, c))
                         using (var r = cmd.ExecuteReader())
                             while (r.Read())
                             {
-                                string p = r[0] as string;
+                                string p = RealPath(r[0] as string);
                                 if (p != null && !SkipDirs.Any(x => p.IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) inside.Add(p);
                             }
                     }
@@ -2128,8 +2899,153 @@ public class Monkey : Form
         catch { return false; }
     }
 
+    // " AND CONTAINS(column, '"part*"')" for each plain part of each word.
+    static string IndexWords(string column, IEnumerable<string> words)
+    {
+        return string.Join("", words.SelectMany(w => Regex.Split(w, @"[^\p{L}\p{N}]+")).Where(t => t.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase).Select(t => " AND CONTAINS(" + column + ", '\"" + t + "*\"')"));
+    }
+
+    // ---- Spelling forgiveness ----
+    // When nothing matches, folders whose names are spelled nearly the same: "marriage" finds "layana marriege",
+    // "thrisur" finds "Thrissur". From the list of folder names Windows Search knows plus the monkey's own list,
+    // kept in memory (made when the chat opens, refreshed every 20 minutes), never saved.
+
+    static volatile string[] indexDirs;
+    static DateTime indexDirsAt;
+    static int indexDirsLoading;
+
+    static void WarmIndexDirs()
+    {
+        if (indexDirs != null && (DateTime.UtcNow - indexDirsAt).TotalMinutes < 20) return;
+        if (Interlocked.Exchange(ref indexDirsLoading, 1) == 1) return;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                var list = new List<string>();
+                using (var c = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
+                {
+                    c.Open();
+                    using (var cmd = new System.Data.OleDb.OleDbCommand("SELECT System.ItemUrl FROM SystemIndex WHERE System.ItemType = 'Directory'", c))
+                    using (var r = cmd.ExecuteReader())
+                        while (r.Read())
+                        {
+                            string p = RealPath(r[0] as string);
+                            if (p != null && !SkipDirs.Any(x => (p + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0 && !(p + "\\").EndsWith(x, StringComparison.OrdinalIgnoreCase))) list.Add(p);
+                        }
+                }
+                indexDirs = list.ToArray(); indexDirsAt = DateTime.UtcNow;
+            }
+            catch { }
+            finally { indexDirsLoading = 0; }
+        });
+        t.IsBackground = true;
+        t.Priority = ThreadPriority.Lowest;
+        t.Start();
+    }
+
+    // How many letters apart two words are (a swapped pair counts as one).
+    static int Distance(string a, string b)
+    {
+        a = a.ToLowerInvariant(); b = b.ToLowerInvariant();
+        var d = new int[a.Length + 1, b.Length + 1];
+        for (int i = 0; i <= a.Length; i++) d[i, 0] = i;
+        for (int j = 0; j <= b.Length; j++) d[0, j] = j;
+        for (int i = 1; i <= a.Length; i++)
+            for (int j = 1; j <= b.Length; j++)
+            {
+                int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) d[i, j] = Math.Min(d[i, j], d[i - 2, j - 2] + 1);
+            }
+        return d[a.Length, b.Length];
+    }
+
+    // How far a typed word is from the closest word in a name (or the start of one), or -1 if too far.
+    static int Closeness(string typed, string[] parts)
+    {
+        int allowed = typed.Length >= 8 ? 2 : typed.Length >= 5 ? 1 : 0;
+        if (allowed == 0) return -1;
+        int best = int.MaxValue;
+        foreach (string part in parts)
+        {
+            if (part.Length < 3) continue;
+            best = Math.Min(best, Distance(typed, part));
+            if (part.Length > typed.Length) best = Math.Min(best, Distance(typed, part.Substring(0, typed.Length)) + (part.Length - typed.Length > 3 ? 1 : 0));
+        }
+        return best <= allowed ? best : -1;
+    }
+
+    static List<string> NearlyNamed(List<string> words, bool wholePc)
+    {
+        var typed = words.SelectMany(w => Regex.Split(w, @"[^\p{L}\p{N}]+")).Where(t => t.Length > 0).ToList();
+        if (typed.Count == 0 || typed.All(t => t.Length < 5)) return new List<string>();
+        var sw = Stopwatch.StartNew();
+        while (indexDirs == null && indexDirsLoading == 1 && sw.ElapsedMilliseconds < 5000) Thread.Sleep(50);   // first time: wait for the list
+        var pool = new List<string>();
+        string[] idx = indexDirs;
+        if (idx != null) pool.AddRange(idx);
+        if (wholePc) { DiskList d = diskList; if (d != null) for (int i = 0; i < d.Paths.Length; i++) if (d.IsDir[i]) pool.Add(d.Paths[i]); }
+        var scored = new List<KeyValuePair<string, int>>();
+        foreach (string p in pool.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            string[] parts = Regex.Split(System.IO.Path.GetFileName(p.TrimEnd('\\')), @"[^\p{L}\p{N}]+");
+            int total = 0;
+            bool ok = true;
+            foreach (string t in typed)
+            {
+                int c = t.Length < 5 ? (parts.Any(x => x.StartsWith(t, StringComparison.OrdinalIgnoreCase)) ? 0 : -1) : Closeness(t, parts);
+                if (c < 0) { ok = false; break; }
+                total += c;
+            }
+            if (ok) scored.Add(new KeyValuePair<string, int>(p, total));
+        }
+        return scored.OrderBy(x => x.Value).ThenBy(x => x.Key.Count(ch => ch == '\\')).Take(10).Select(x => x.Key).ToList();
+    }
+
+    // Folders called 'name' somewhere inside a folder whose name has the 'within' words.
+    static void SearchDirsWithin(List<string> name, List<string> within, bool wholePc, List<string> dirs)
+    {
+        Func<string, bool> inside = path =>
+        {
+            string parent = System.IO.Path.GetDirectoryName(path.TrimEnd('\\')) ?? "";
+            return within.All(w => parent.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0);
+        };
+        try
+        {
+            using (var c = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
+            {
+                c.Open();
+                // Every folder with that name (quick), then keep the ones inside the right folder (matching
+                // the path in the query itself takes Windows Search seconds).
+                string sql = "SELECT TOP 2000 System.ItemUrl FROM SystemIndex WHERE System.ItemType = 'Directory'"
+                    + IndexWords("System.FileName", name);
+                using (var cmd = new System.Data.OleDb.OleDbCommand(sql, c))
+                using (var r = cmd.ExecuteReader())
+                    while (r.Read()) { string p = RealPath(r[0] as string); if (p != null && inside(p)) dirs.Add(p); }
+            }
+        }
+        catch { }
+        if (!wholePc) return;
+        DiskList d = Disk();
+        if (d == null) return;
+        for (int i = 0; i < d.Paths.Length && dirs.Count < 200; i++)
+            if (d.IsDir[i] && StartsWords(System.IO.Path.GetFileName(d.Paths[i]), name) && inside(d.Paths[i])) dirs.Add(d.Paths[i]);
+    }
+
+    // "file:C:/Users/me/Pictures/Screenshots - Copy" -> C:\Users\me\Pictures\Screenshots - Copy
+    static string RealPath(string url)
+    {
+        if (string.IsNullOrEmpty(url) || !url.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return null;
+        string p = url.Substring(5).TrimStart('/').Replace('/', '\\');
+        if (p.Contains("%") && !System.IO.File.Exists(p) && !System.IO.Directory.Exists(p))
+            try { p = Uri.UnescapeDataString(p); } catch { }
+        return p;
+    }
+
     // No Windows Search: look through your own folders by name instead (a few seconds at most).
-    static void SearchHome(List<string> words, List<string> exts, bool foldersOnly, List<string> dirs, List<string> files)
+    static void SearchHome(List<string> words, List<string> dirWords, List<string> exts, bool foldersOnly, List<string> dirs, List<string> files)
     {
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var sw = Stopwatch.StartNew();
@@ -2151,9 +3067,9 @@ public class Monkey : Form
                 foreach (string d in System.IO.Directory.GetDirectories(dir))
                 {
                     string n = System.IO.Path.GetFileName(d);
-                    if (n.StartsWith(".") || SkipDirs.Any(x => (d + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
-                    stack.Push(d);
-                    if (words.Count > 0 && exts.Count == 0 && StartsWords(n, words)) dirs.Add(d);
+                    if (n.StartsWith(".")) continue;
+                    if (dirWords.Count > 0 && StartsWords(n, dirWords)) dirs.Add(d);
+                    if (!SkipDirs.Any(x => (d + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) stack.Push(d);
                 }
                 if (foldersOnly) continue;
                 foreach (string f in System.IO.Directory.GetFiles(dir))
@@ -2165,27 +3081,32 @@ public class Monkey : Form
         }
     }
 
-    static List<string> Rank(List<string> dirs, List<string> files, List<string> inside, List<string> words, bool foldersOnly, int max, List<string> privates)
+    static List<string> Rank(List<string> dirs, List<string> files, List<string> inside, List<string> words, List<string> dirWords, bool foldersOnly, int max, List<string> privates)
     {
         Func<string, string> name = p => System.IO.Path.GetFileName(p.TrimEnd('\\'));
         dirs = dirs.Where(d => !IsPrivate(d, privates)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         files = files.Where(f => !IsPrivate(f, privates)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         inside = inside.Where(f => !IsPrivate(f, privates)).ToList();
         // Whole-word matches if there are any (the index's word-start search also lets through some it shouldn't).
-        Func<List<string>, List<string>> best = list =>
+        Func<List<string>, List<string>, List<string>> best = (list, by) =>
         {
-            var good = list.Where(p => StartsWords(name(p), words)).ToList();
+            var good = list.Where(p => StartsWords(name(p), by)).ToList();
             return good.Count > 0 ? good : list;
         };
-        dirs = best(dirs);
-        files = best(files).OrderByDescending(f => { try { return System.IO.File.GetLastWriteTime(f); } catch { return DateTime.MinValue; } }).ToList();
-        // A folder inside another folder that matched is left out: "neema new\Neema Homes_files" under "neema new".
-        var top = dirs.Where(d => !dirs.Any(o => o.Length < d.Length && d.StartsWith(o.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))).ToList();
+        dirs = best(dirs, dirWords);
+        files = best(files, words).OrderByDescending(f => { try { return System.IO.File.GetLastWriteTime(f); } catch { return DateTime.MinValue; } }).ToList();
+        // A folder inside another folder that matched is left out ("neema new\Neema Homes_files" under "neema new"),
+        // but every folder called exactly what you typed is kept ("BIGMART" and "BIGMART\BIGMART").
+        var exact = new HashSet<string>(dirs.Where(d => NameIs(d, dirWords)), StringComparer.OrdinalIgnoreCase);
+        var top = dirs.Where(d => exact.Contains(d)
+            || !dirs.Any(o => o.Length < d.Length && d.StartsWith(o.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))).ToList();
+        // Lots of folders called exactly that ("assets", "js"): show up to 10 of them.
+        int room = foldersOnly ? max : Math.Min(max, Math.Max(6, Math.Min(10, top.Count(d => exact.Contains(d)))));
         var folders = top
-            .OrderByDescending(d => NameIs(d, words))
+            .OrderByDescending(d => exact.Contains(d))
             .ThenBy(d => d.Count(ch => ch == '\\'))
             .ThenByDescending(d => { try { return System.IO.Directory.GetLastWriteTime(d); } catch { return DateTime.MinValue; } })
-            .Take(foldersOnly ? max : Math.Min(6, max));
+            .Take(room);
         return folders.Concat(files).Concat(inside).Distinct(StringComparer.OrdinalIgnoreCase).Take(max).ToList();
     }
 
@@ -2255,8 +3176,9 @@ public class Monkey : Form
         while (stack.Count > 0 && paths.Count < 500000 && sw.Elapsed.TotalSeconds < 90)
         {
             string dir = stack.Pop();
-            if (IsPrivate(dir, null) || SkipDirs.Any(x => (dir + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
+            if (IsPrivate(dir, null)) continue;
             paths.Add(dir); isDir.Add(true);
+            if (SkipDirs.Any(x => (dir + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) continue;   // a venv or the like: findable, but not what's inside
             try
             {
                 foreach (var e in new System.IO.DirectoryInfo(dir).EnumerateFileSystemInfos())
@@ -2274,9 +3196,9 @@ public class Monkey : Form
         return new DiskList { Paths = paths.ToArray(), IsDir = isDir.ToArray(), At = DateTime.UtcNow };
     }
 
-    static void SearchDisk(List<string> words, List<string> exts, bool foldersOnly, List<string> dirs, List<string> files)
+    static void SearchDisk(List<string> words, List<string> dirWords, List<string> exts, bool foldersOnly, List<string> dirs, List<string> files)
     {
-        if (words.Count == 0 && exts.Count == 0) return;
+        if (dirWords.Count == 0 && words.Count == 0 && exts.Count == 0) return;
         DiskList d = Disk();
         if (d == null) return;
         int nd = 0, nf = 0;
@@ -2285,8 +3207,8 @@ public class Monkey : Form
             string path = d.Paths[i];
             if (d.IsDir[i])
             {
-                if (exts.Count > 0 || words.Count == 0 || nd >= 100) continue;
-                if (StartsWords(System.IO.Path.GetFileName(path), words)) { dirs.Add(path); nd++; }
+                if (dirWords.Count == 0 || nd >= 100) continue;
+                if (StartsWords(System.IO.Path.GetFileName(path), dirWords)) { dirs.Add(path); nd++; }
             }
             else
             {
@@ -2634,6 +3556,85 @@ public class Monkey : Form
             SaveSettings();
             Say("I won't look in " + System.IO.Path.GetFileName(f) + "!", true);
         }
+    }
+
+    // ---- Saved chats: deleted automatically ----
+    // Claude Code saves each conversation as a file on this PC (in .claude\projects\, in a folder of Monkey's own).
+    // The monkey doesn't use old ones after it restarts, so they're deleted after a while: only in that one
+    // folder, only conversation files, and never the conversation you're in now.
+    int chatKeepDays = 7;            // 0 = when you press New chat, -1 = never
+    double nextChatClean = 30;
+
+    internal static string SavedChatsDir
+    {
+        get
+        {
+            string root = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+            if (string.IsNullOrEmpty(root)) root = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+            return System.IO.Path.Combine(root, "projects", Regex.Replace(ChatDir, "[^A-Za-z0-9]", "-"));
+        }
+    }
+
+    // Deletes saved conversations older than the setting ('all' = every one but the current one). Returns how many.
+    static int CleanSavedChats(int keepDays, bool all, string current)
+    {
+        int gone = 0;
+        try
+        {
+            string dir = SavedChatsDir;
+            if (!dir.EndsWith("MonkeyPlay-chat", StringComparison.OrdinalIgnoreCase) || !System.IO.Directory.Exists(dir)) return 0;
+            DateTime cutoff = DateTime.Now.AddDays(-Math.Max(0, keepDays));
+            foreach (string f in System.IO.Directory.GetFiles(dir, "*.jsonl"))
+            {
+                string id = System.IO.Path.GetFileNameWithoutExtension(f);
+                if (!Regex.IsMatch(id, "^[0-9a-fA-F-]{36}$")) continue;                                // only conversation files
+                if (current != null && string.Equals(id, current, StringComparison.OrdinalIgnoreCase)) continue;   // the one you're in
+                if (!all && System.IO.File.GetLastWriteTime(f) > cutoff) continue;
+                try { System.IO.File.Delete(f); gone++; } catch { }   // in use right now: next time
+            }
+        }
+        catch { }
+        return gone;
+    }
+
+    // Every few hours (and a little after starting): tidy up by the setting.
+    void UpdateChatCleaning(double now)
+    {
+        if (now < nextChatClean) return;
+        nextChatClean = now + 3 * 3600;
+        int keep = chatKeepDays;
+        string current = chatSession;
+        if (keep < 0) return;
+        ThreadPool.QueueUserWorkItem(_ => CleanSavedChats(keep, keep == 0, current));
+    }
+
+    ToolStripMenuItem ChatHistoryMenu()
+    {
+        var parent = new ToolStripMenuItem("Delete saved chats after");
+        int[] days = { 0, 1, 7, 30, -1 };
+        string[] names = { "When I press New chat", "1 day", "7 days", "30 days", "Never" };
+        for (int i = 0; i < days.Length; i++)
+        {
+            int d = days[i];
+            var it = new ToolStripMenuItem(names[i]) { Checked = chatKeepDays == d };
+            it.Click += (s, e) =>
+            {
+                chatKeepDays = d;
+                foreach (ToolStripItem other in parent.DropDownItems) { var m = other as ToolStripMenuItem; if (m != null && m.CheckOnClick == false && m.Tag == null) m.Checked = m == s; }
+                SaveSettings();
+                nextChatClean = 0;   // apply it now
+            };
+            parent.DropDownItems.Add(it);
+        }
+        parent.DropDownItems.Add(new ToolStripSeparator());
+        parent.DropDownItems.Add(new ToolStripMenuItem("Delete all saved chats now...", null, (s, e) =>
+        {
+            if (MessageBox.Show("Delete all of Monkey's saved chats from this PC?\n\nThe conversation open right now is kept until you press New chat.",
+                "Monkey Play", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            int n = CleanSavedChats(0, true, chatSession);
+            Say(n == 0 ? "Nothing to delete!" : "Poof! " + n + " old chat" + (n == 1 ? "" : "s") + " gone.", true);
+        }) { Tag = "now" });
+        return parent;
     }
 
     ToolStripMenuItem BrainMenu()
@@ -3469,6 +4470,9 @@ public class Monkey : Form
         UpdateShades(now);
         UpdateWeather(now);
         UpdateChime(now);
+        UpdateBattery(now);
+        UpdateCheckup(now);
+        UpdateChatCleaning(now);
         UpdateChat(now, dt);
 
         double ropeTarget = HandPose ? ArmLen : L, ropeRate = 7;
@@ -6055,7 +7059,7 @@ class ChatBox : Form
         Controls.Add(history);
         Controls.Add(bottom);
         AddNote("Hi! I'm Monkey. Ask me anything; I only see what you type here (plus your copied text or one file, when you add them).\n"
-            + "To find a file, type \"find\" and its name (like: find GST invoice). To open an app or folder, type \"open excel\" or \"open downloads\". I do that right here on your PC, "
+            + "To find a file, type \"find\" and its name (like: find GST invoice). To open an app or folder, type \"open excel\" or \"open downloads\". Type \"battery\" for a battery check-up, or \"check my laptop\" for a full check-up. I do that right here on your PC, "
             + "and none of it is sent anywhere.");
     }
 
@@ -6133,6 +7137,23 @@ class ChatBox : Form
             history.SelectionFont = history.Font;
             history.SelectionColor = Color.Black;
         }
+        history.ScrollToCaret();
+    }
+
+    // Links to open (Settings pages and the like): one click each.
+    public void AddLinks(string heading, List<KeyValuePair<string, string>> links)
+    {
+        history.SelectionStart = history.TextLength;
+        history.SelectionColor = Color.Gray;
+        history.AppendText(heading + "\n");
+        foreach (var l in links)
+        {
+            history.SelectionStart = history.TextLength;
+            history.AppendText("   ");
+            AppendLink("\u25B6 " + l.Key, l.Value, false);
+            history.AppendText("\n");
+        }
+        history.SelectionColor = Color.Black;
         history.ScrollToCaret();
     }
 

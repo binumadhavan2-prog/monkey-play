@@ -18,7 +18,7 @@ if not errorlevel 1 (
 )
 
 "%FW%\csc.exe" -nologo -target:winexe -optimize -out:"Monkey Play.exe" ^
-    -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll -r:System.IO.Compression.dll ^
+    -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll -r:System.IO.Compression.dll -r:System.Management.dll ^
     -r:"%FW%\WPF\UIAutomationClient.dll" -r:"%FW%\WPF\UIAutomationTypes.dll" -r:"%FW%\WPF\WindowsBase.dll" ^
     %* MonkeyPlay.cs
 if errorlevel 1 exit /b 1
