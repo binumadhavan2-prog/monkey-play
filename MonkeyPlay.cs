@@ -777,6 +777,8 @@ public class Monkey : Form
                 else if (key == "eyesMinutes" && int.TryParse(val, out n) && n > 0) eyesEvery = n * 60;
                 else if (key == "weather" && bool.TryParse(val, out b)) weatherOn = b;
                 else if (key == "chime" && bool.TryParse(val, out b)) chimeOn = b;
+                else if (key == "findWholePC" && bool.TryParse(val, out b)) findWholePC = b;
+                else if (key == "privateFolders") privateFolders = val.Split('|').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
                 else if (key == "weatherAt") weatherAt = val;
                 else if (key == "weatherPlace") { LoadPlace(val); savedPlace = val; }
             }
@@ -802,6 +804,8 @@ public class Monkey : Form
                 "eyesMinutes=" + (int)(eyesEvery / 60),
                 "weather=" + weatherOn,
                 "chime=" + chimeOn,
+                "findWholePC=" + findWholePC,
+                "privateFolders=" + string.Join("|", privateFolders),
                 "weatherAt=" + weatherAt,
                 "weatherPlace=" + (savedPlace = PlaceSetting()),
             });
@@ -1295,6 +1299,7 @@ public class Monkey : Form
 
         menu.Items.Add("Ask Monkey... (double-click me)", null, (s, e) => OpenChat());
         menu.Items.Add(BrainMenu());
+        menu.Items.Add(FindMenu());
         menu.Items.Add(new ToolStripSeparator());
         var pullItem = new ToolStripMenuItem("Monkey opens my tabs") { Checked = pullTabs, CheckOnClick = true };
         pullItem.CheckedChanged += (s, e) => { pullTabs = pullItem.Checked; SaveSettings(); };
@@ -1567,7 +1572,10 @@ public class Monkey : Form
         "[do:shades_off] take off your sunglasses (you push them up onto your head), [do:shades_on] put them back over your eyes, [do:wave] wave, " +
         "[do:banana] eat a banana from your pocket, [do:drink] drink some water, [do:sit] sit on your branch, " +
         "[do:climb] climb up your tail, [do:look] look around. Use a tag only when the user asks you to do that " +
-        "(or it clearly fits), at most one per reply. The user never sees the tag, so also say what you're doing.";
+        "(or it clearly fits), at most one per reply. The user never sees the tag, so also say what you're doing. " +
+        "You can't open apps yourself, but when the user wants an app opened (or one clearly helps), put [app:Name] " +
+        "at the very end, using the app's usual name (like [app:Excel] or [app:Calculator]): the monkey app shows them " +
+        "an Open button and nothing opens unless they click it. They can also type \"open\" and an app's name.";
 
     void OpenChat()
     {
@@ -1591,6 +1599,8 @@ public class Monkey : Form
         chat.Activate();
         chat.FocusInput();
         EnsureLink();   // start Claude Code now, so the first answer is quick too
+        WarmApps();
+        if (findWholePC) WarmDisk();
         if (chatSession == null && chat.IsEmpty) Say(Pick("Ask me anything!", "What's up?", "Hi! How can I help?"), true);
     }
 
@@ -1664,16 +1674,26 @@ public class Monkey : Form
 
     List<string> lastFound = new List<string>();
 
-    static readonly Regex FindCmd = new Regex(@"^(?:please\s+)?(?:can you\s+|could you\s+)?(find|search(?:\s+for)?|look\s+for|locate|where\s+is|where's|open)\s+(.+?)[\s?.!]*$",
+    static readonly Regex FindCmd = new Regex(@"^(?:please\s+)?(?:can you\s+|could you\s+)?(find|search(?:\s+for)?|look\s+for|locate|where\s+is|where's|open|launch|start|run)\s+(.+?)[\s?.!]*$",
         RegexOptions.IgnoreCase);
     static readonly Regex OpenNumber = new Regex(@"^open\s+(?:no\.?\s*|number\s+|#)?(\d{1,2})[\s.!]*$", RegexOptions.IgnoreCase);
     static readonly HashSet<string> Filler = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
         "my", "the", "a", "an", "file", "files", "document", "documents", "doc", "named", "called", "with", "for", "of", "on",
-        "in", "me", "please", "that", "this", "some", "any", "all", "from", "pc", "computer", "laptop", "folder" };
+        "in", "me", "please", "that", "this", "some", "any", "all", "from", "pc", "computer", "laptop" };
+    static readonly HashSet<string> FolderWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "folder", "folders", "directory", "directories", "dir" };
 
     bool FileCommand(string q)
     {
         Match m = OpenNumber.Match(q);
+        if (m.Success && lastListedApps && lastApps.Count > 0)
+        {
+            int n = int.Parse(m.Groups[1].Value);
+            chat.AddMessage("You", q);
+            if (n >= 1 && n <= lastApps.Count) { OpenApp(lastApps[n - 1]); chat.AddNote("Opening " + lastApps[n - 1].Name + "..."); }
+            else chat.AddNote("There's no number " + n + " in the list.");
+            return true;
+        }
         if (m.Success && lastFound.Count > 0)
         {
             int n = int.Parse(m.Groups[1].Value);
@@ -1697,27 +1717,45 @@ public class Monkey : Form
             return true;
         }
 
-        // The words to look for, and a file type if one was named ("my GST pdf", "excel sheet").
+        // "open excel", "launch calculator", "start chrome": an app from your Start menu.
+        if (verb == "open" || verb == "launch" || verb == "start" || verb == "run")
+        {
+            List<App> apps = AppMatches(what);
+            if (apps.Count > 0)
+            {
+                chat.AddMessage("You", q);
+                if (apps.Count == 1)
+                {
+                    OpenApp(apps[0]);
+                    chat.AddNote("Opening " + apps[0].Name + "...");
+                    Say(Pick("Here you go!", "Opening it!", "Ta-da!"), true);
+                }
+                else
+                {
+                    lastApps = apps; lastListedApps = true;
+                    chat.AddApps("I found " + apps.Count + " apps for \"" + what + "\". Click one to open it, or type \"open 1\":", apps, true);
+                    Say(Pick("Which one?", "Pick one!"), true);
+                }
+                return true;
+            }
+            if (verb != "open") return false;   // not an app: let Monkey answer
+        }
+
         var exts = new List<string>();
         var words = new List<string>();
-        foreach (string raw in Regex.Split(what, @"[\s,]+"))
-        {
-            string w = Regex.Replace(raw, @"[^\w.\-]", "").Trim('.');
-            if (w.Length == 0 || Filler.Contains(w)) continue;
-            string[] kind = KindExtensions(w);
-            if (kind != null) { exts.AddRange(kind); continue; }
-            if (Regex.IsMatch(w, @"^\.?[a-z0-9]{2,5}$", RegexOptions.IgnoreCase) && raw.StartsWith(".")) { exts.Add("." + w.TrimStart('.').ToLowerInvariant()); continue; }
-            words.Add(w);
-        }
+        bool foldersOnly;
+        ParseSearch(what, words, exts, out foldersOnly);
         if (words.Count == 0 && exts.Count == 0) return false;   // nothing to look for: let Monkey answer
 
         chat.AddMessage("You", q);
         chat.SetBusy(true);
         Say(Pick("Let me look...", "Searching my branches...", "Hmm, where did you put it..."), true, 10);
+        bool wholePc = findWholePC;
+        var privates = privateFolders.ToList();   // a copy for the search thread
         var found = new List<string>();
         ThreadPool.QueueUserWorkItem(_ =>
         {
-            try { found = SearchFiles(words, exts, 15); } catch { }
+            try { found = SearchFiles(words, exts, foldersOnly, 15, wholePc, privates); } catch { }
             try
             {
                 BeginInvoke((Action)(() =>
@@ -1726,14 +1764,16 @@ public class Monkey : Form
                     string label = string.Join(" ", words) + (exts.Count > 0 ? (words.Count > 0 ? " " : "") + "(" + string.Join(", ", exts.Distinct()) + ")" : "");
                     if (found.Count == 0)
                     {
-                        chat.AddNote("I couldn't find any file matching \"" + label + "\". Try fewer or different words, or part of the file name.");
+                        chat.AddNote("I couldn't find any " + (foldersOnly ? "folder" : "file or folder") + " matching \"" + label + "\". Try fewer or different words, or part of the name.");
                         Say(Pick("Couldn't find it!", "No luck, sorry!"), true);
                         return;
                     }
-                    lastFound = found;
+                    lastFound = found; lastListedApps = false;
                     chat.AddFiles((found.Count == 1 ? "Found 1 match" : "Found " + found.Count + " matches") + " for \"" + label
-                        + "\" (newest first). Click a name to open it, or type \"open 1\":", found);
-                    if (verb == "open" && found.Count == 1) { OpenFile(found[0], false); chat.AddNote("Opening it..."); }
+                        + "\" (folders first, then newest files). Click a name to open it, or type \"open 1\":", found);
+                    // "open neema" opens the folder called just that; otherwise only a single match opens by itself.
+                    if (verb == "open" && (found.Count == 1 || (System.IO.Directory.Exists(found[0]) && NameIs(found[0], words))))
+                    { OpenFile(found[0], false); chat.AddNote("Opening " + System.IO.Path.GetFileName(found[0].TrimEnd('\\')) + "..."); }
                     Say(Pick("Found it!", "Here's what I found!", "Got some!"), true);
                 }));
             }
@@ -1741,6 +1781,101 @@ public class Monkey : Form
         });
         return true;
     }
+
+    // ---- Opening apps (from your Start menu only; nothing here is sent to Claude) ----
+    // The list is the Start menu's "All apps" (shell:AppsFolder), so it only ever opens an app you have installed,
+    // the same way clicking it in the Start menu would: never a typed path or command.
+
+    internal sealed class App { public string Name, Id; }
+    List<App> lastApps = new List<App>();
+    bool lastListedApps;   // "open 2" means the last app list, not the last file list
+    static List<App> appList;
+    static DateTime appListAt;
+    static readonly object appLock = new object();
+    static readonly Regex NotAnApp = new Regex(@"\b(uninstall|readme|read me|help|documentation|manual|website|release notes|license|changelog)\b", RegexOptions.IgnoreCase);
+
+    static List<App> Apps()
+    {
+        lock (appLock)
+        {
+            if (appList != null && (DateTime.UtcNow - appListAt).TotalMinutes < 10) return appList;
+            List<App> list = null;
+            // The Shell's objects want a single-threaded apartment: read them on a thread of their own.
+            var t = new Thread(() => { try { list = ReadAppsFolder(); } catch { } });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+            t.Join(8000);
+            if (list != null) { appList = list; appListAt = DateTime.UtcNow; }
+            return appList ?? new List<App>();
+        }
+    }
+
+    // Reads the list ahead of time, so the first "open ..." is instant.
+    static void WarmApps() { ThreadPool.QueueUserWorkItem(_ => Apps()); }
+
+    static List<App> ReadAppsFolder()
+    {
+        var call = System.Reflection.BindingFlags.InvokeMethod;
+        var get = System.Reflection.BindingFlags.GetProperty;
+        Type type = Type.GetTypeFromProgID("Shell.Application");
+        object shell = Activator.CreateInstance(type);
+        var list = new List<App>();
+        try
+        {
+            object folder = type.InvokeMember("NameSpace", call, null, shell, new object[] { "shell:AppsFolder" });
+            object items = folder.GetType().InvokeMember("Items", call, null, folder, null);
+            int count = (int)items.GetType().InvokeMember("Count", get, null, items, null);
+            for (int i = 0; i < count; i++)
+            {
+                object it = items.GetType().InvokeMember("Item", call, null, items, new object[] { i });
+                if (it == null) continue;
+                string name = it.GetType().InvokeMember("Name", get, null, it, null) as string;
+                string id = it.GetType().InvokeMember("Path", get, null, it, null) as string;
+                if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(id) || NotAnApp.IsMatch(name)) continue;
+                if (id.StartsWith("http", StringComparison.OrdinalIgnoreCase)) continue;   // web links, not apps
+                list.Add(new App { Name = name.Trim(), Id = id });
+            }
+        }
+        finally { Marshal.FinalReleaseComObject(shell); }
+        return list;
+    }
+
+    static readonly HashSet<string> AppFiller = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "my", "the", "a", "an", "app", "application", "program", "please", "for", "me", "up" };
+
+    // Apps named exactly what you typed, or failing that, apps whose words start with what you typed
+    // ("chrome" fits "Google Chrome"). An exact name wins on its own.
+    static List<App> AppMatches(string what)
+    {
+        var words = Regex.Split(what, @"[\s,]+").Select(w => Regex.Replace(w, @"[^\w.+#\-]", "")).Where(w => w.Length > 0 && !AppFiller.Contains(w)).ToList();
+        if (words.Count == 0) return new List<App>();
+        string wanted = string.Join(" ", words);
+        List<App> apps = Apps();
+        var exact = apps.Where(a => string.Equals(a.Name, wanted, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (exact.Count > 0) return exact.Take(1).ToList();
+        return apps.Where(a => StartsWords(a.Name, words))
+            .GroupBy(a => a.Name, StringComparer.OrdinalIgnoreCase).Select(g => g.First())
+            .OrderBy(a => a.Name.Length).Take(8).ToList();
+    }
+
+    // Opens an app the way the Start menu does.
+    internal static void OpenApp(App app)
+    {
+        try
+        {
+            if (System.IO.Path.IsPathRooted(app.Id) && System.IO.File.Exists(app.Id))
+                Process.Start(new ProcessStartInfo(app.Id) { UseShellExecute = true, WorkingDirectory = System.IO.Path.GetDirectoryName(app.Id) });
+            else Process.Start("explorer.exe", "shell:AppsFolder\\" + app.Id);
+        }
+        catch { }
+    }
+
+    // When Monkey suggests an app it only shows a button; you click to open it. It never offers ones that run
+    // commands or change how Windows works, in case a file or copied text tries to talk it into that.
+    static readonly Regex RiskyApp = new Regex(@"powershell|command prompt|\bcmd\b|terminal|registry|regedit|console|bash|\bwsl\b|ubuntu|\bshell\b|"
+        + @"group policy|task scheduler|services|computer management|disk management|recovery|system configuration|administrative|windows tools",
+        RegexOptions.IgnoreCase);
 
     static string[] KindExtensions(string w)
     {
@@ -1789,60 +1924,264 @@ public class Monkey : Form
         return words.All(w => Regex.IsMatch(name, @"(?:^|(?<=[^A-Za-z0-9])|(?<=[0-9])(?=[A-Za-z])|(?-i:(?<=[a-z])(?=[A-Z])))" + Regex.Escape(w), RegexOptions.IgnoreCase));
     }
 
-    // Newest first: names where the words start a word, then files whose contents have them, then names
-    // that only have them in the middle of a word (only if nothing better turned up).
-    static List<string> SearchFiles(List<string> words, List<string> exts, int max)
+    // The words to look for, a file type if one was named ("my GST pdf", "excel sheet"), and whether only
+    // folders are wanted ("find neema folder").
+    static void ParseSearch(string what, List<string> words, List<string> exts, out bool foldersOnly)
     {
+        foldersOnly = false;
+        foreach (string raw in Regex.Split(what, @"[\s,]+"))
+        {
+            string w = Regex.Replace(raw, @"[^\w.\-]", "").Trim('.');
+            if (w.Length == 0 || Filler.Contains(w)) continue;
+            if (FolderWords.Contains(w)) { foldersOnly = true; continue; }
+            string[] kind = KindExtensions(w);
+            if (kind != null) { exts.AddRange(kind); continue; }
+            if (Regex.IsMatch(w, @"^\.?[a-z0-9]{2,5}$", RegexOptions.IgnoreCase) && raw.StartsWith(".")) { exts.Add("." + w.TrimStart('.').ToLowerInvariant()); continue; }
+            words.Add(w);
+        }
+        if (exts.Count > 0) foldersOnly = false;   // "pdf folder" means pdfs
+    }
+
+    // Is the file or folder called just these words? ("neema" is "neema", not "neema new"; "monkey play" is "Monkey_Play")
+    static bool NameIs(string path, List<string> words)
+    {
+        string name = System.IO.Path.GetFileName(path.TrimEnd('\\'));
+        if (!System.IO.Directory.Exists(path)) name = System.IO.Path.GetFileNameWithoutExtension(name);
+        return words.Count > 0 && string.Equals(Regex.Replace(name, @"[\s_.\-]+", " ").Trim(), string.Join(" ", words), StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Folders first (the one called exactly that, then the least deeply buried, and not the folders inside
+    // another match), then files whose names have the words, newest first, then files that only have them inside.
+    // Word-start matches come from the index directly, so a search takes a few hundredths of a second.
+    static List<string> SearchFiles(List<string> words, List<string> exts, bool foldersOnly, int max, bool wholePc, List<string> privates)
+    {
+        var dirs = new List<string>();
+        var files = new List<string>();
+        var inside = new List<string>();
+        if (!SearchIndex(words, exts, foldersOnly, max, dirs, files, inside)) SearchHome(words, exts, foldersOnly, dirs, files);
+        if (wholePc) SearchDisk(words, exts, foldersOnly, dirs, files);
+        return Rank(dirs, files, inside, words, foldersOnly, max, privates);
+    }
+
+    // The Windows Search index: your user folders, instantly. False if Windows Search isn't there.
+    static bool SearchIndex(List<string> words, List<string> exts, bool foldersOnly, int max, List<string> dirs, List<string> files, List<string> inside)
+    {
+        string skip = string.Join(" AND ", SkipDirs.Select(d => "System.ItemPathDisplay NOT LIKE '%" + d + "%'"));
         string extSql = exts.Count == 0 ? "" : " AND (" + string.Join(" OR ", exts.Distinct().Select(e => "System.FileExtension = '" + e + "'")) + ")";
-        string where = string.Join(" AND ", SkipDirs.Select(d => "System.ItemPathDisplay NOT LIKE '%" + d + "%'")) + extSql;
+        Func<string, string> clean = w => Regex.Replace(w, "[\"'*%()]", "");
+        string byWords = string.Join("", words.Select(w => " AND CONTAINS(System.FileName, '\"" + clean(w) + "*\"')"));
+        string inWords = string.Join("", words.Select(w => " AND System.FileName LIKE '%" + clean(w) + "%'"));
         try
         {
-            var byName = new List<string>();
-            var byContent = new List<string>();
             using (var c = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
             {
                 c.Open();
                 Action<string, int, List<string>> run = (cond, top, into) =>
                 {
-                    string sql = "SELECT TOP " + top + " System.ItemPathDisplay FROM SystemIndex WHERE " + where + cond + " ORDER BY System.DateModified DESC";
+                    string sql = "SELECT TOP " + top + " System.ItemPathDisplay FROM SystemIndex WHERE " + skip + cond + " ORDER BY System.DateModified DESC";
                     using (var cmd = new System.Data.OleDb.OleDbCommand(sql, c))
                     using (var r = cmd.ExecuteReader())
                         while (r.Read()) { string p = r[0] as string; if (p != null) into.Add(p); }
                 };
-                run(string.Join("", words.Select(w => " AND System.FileName LIKE '%" + w.Replace("'", "").Replace("%", "") + "%'")), 300, byName);
-                if (words.Count > 0)
-                    try { run(string.Join("", words.Select(w => " AND CONTAINS(*, '\"" + Regex.Replace(w, "[\"'*]", "") + "*\"')")), max, byContent); } catch { }
+                const string isDir = " AND System.ItemType = 'Directory'", notDir = " AND System.ItemType <> 'Directory'";
+                if (words.Count > 0 && exts.Count == 0) run(isDir + byWords, 100, dirs);
+                if (!foldersOnly) run(notDir + extSql + byWords, 100, files);
+                // Nothing by whole words: try the words in the middle of names too ("shopping" in "bigmartshopping").
+                if (words.Count > 0 && dirs.Count + files.Count == 0)
+                {
+                    if (exts.Count == 0) run(isDir + inWords, 100, dirs);
+                    if (!foldersOnly) run(notDir + extSql + inWords, 100, files);
+                }
+                if (!foldersOnly && words.Count > 0 && files.Count < max)
+                {
+                    // Searching inside files with the skip list is slow (a second or more), so take extra and skip them here.
+                    string sql = "SELECT TOP " + max * 4 + " System.ItemPathDisplay FROM SystemIndex WHERE System.ItemType <> 'Directory'" + extSql
+                        + string.Join("", words.Select(w => " AND CONTAINS(*, '\"" + clean(w) + "*\"')")) + " ORDER BY System.DateModified DESC";
+                    try
+                    {
+                        using (var cmd = new System.Data.OleDb.OleDbCommand(sql, c))
+                        using (var r = cmd.ExecuteReader())
+                            while (r.Read())
+                            {
+                                string p = r[0] as string;
+                                if (p != null && !SkipDirs.Any(x => p.IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) inside.Add(p);
+                            }
+                    }
+                    catch { }
+                }
             }
-            var good = byName.Where(p => StartsWords(System.IO.Path.GetFileName(p.TrimEnd('\\')), words));
-            var found = good.Concat(byContent).Distinct(StringComparer.OrdinalIgnoreCase).Take(max).ToList();
-            if (found.Count == 0) found = byName.Take(max).ToList();
-            return found;
+            return true;
         }
-        catch { }
+        catch { return false; }
+    }
 
-        // No Windows Search: look through your own folders by name instead (a few seconds at most).
+    // No Windows Search: look through your own folders by name instead (a few seconds at most).
+    static void SearchHome(List<string> words, List<string> exts, bool foldersOnly, List<string> dirs, List<string> files)
+    {
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var sw = Stopwatch.StartNew();
-        var stack = new Stack<string>(new[] { "Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music", "OneDrive" }
-            .Select(f => System.IO.Path.Combine(home, f)).Where(System.IO.Directory.Exists));
-        var hits = new List<System.IO.FileInfo>();
+        var stack = new Stack<string>();
+        try
+        {
+            foreach (string d in System.IO.Directory.GetDirectories(home))
+            {
+                string n = System.IO.Path.GetFileName(d);
+                if (!n.StartsWith(".") && !n.Equals("AppData", StringComparison.OrdinalIgnoreCase)) stack.Push(d);
+            }
+        }
+        catch { }
         while (stack.Count > 0 && sw.ElapsedMilliseconds < 4000)
         {
             string dir = stack.Pop();
             try
             {
-                foreach (string d in System.IO.Directory.GetDirectories(dir)) if (!System.IO.Path.GetFileName(d).StartsWith(".")) stack.Push(d);
-                foreach (string f in System.IO.Directory.GetFiles(dir))
+                foreach (string d in System.IO.Directory.GetDirectories(dir))
                 {
-                    string name = System.IO.Path.GetFileName(f);
-                    if (StartsWords(name, words)
+                    string n = System.IO.Path.GetFileName(d);
+                    if (n.StartsWith(".") || SkipDirs.Any(x => (d + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
+                    stack.Push(d);
+                    if (words.Count > 0 && exts.Count == 0 && StartsWords(n, words)) dirs.Add(d);
+                }
+                if (foldersOnly) continue;
+                foreach (string f in System.IO.Directory.GetFiles(dir))
+                    if (StartsWords(System.IO.Path.GetFileName(f), words)
                         && (exts.Count == 0 || exts.Contains(System.IO.Path.GetExtension(f).ToLowerInvariant())))
-                        hits.Add(new System.IO.FileInfo(f));
+                        files.Add(f);
+            }
+            catch { }
+        }
+    }
+
+    static List<string> Rank(List<string> dirs, List<string> files, List<string> inside, List<string> words, bool foldersOnly, int max, List<string> privates)
+    {
+        Func<string, string> name = p => System.IO.Path.GetFileName(p.TrimEnd('\\'));
+        dirs = dirs.Where(d => !IsPrivate(d, privates)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        files = files.Where(f => !IsPrivate(f, privates)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        inside = inside.Where(f => !IsPrivate(f, privates)).ToList();
+        // Whole-word matches if there are any (the index's word-start search also lets through some it shouldn't).
+        Func<List<string>, List<string>> best = list =>
+        {
+            var good = list.Where(p => StartsWords(name(p), words)).ToList();
+            return good.Count > 0 ? good : list;
+        };
+        dirs = best(dirs);
+        files = best(files).OrderByDescending(f => { try { return System.IO.File.GetLastWriteTime(f); } catch { return DateTime.MinValue; } }).ToList();
+        // A folder inside another folder that matched is left out: "neema new\Neema Homes_files" under "neema new".
+        var top = dirs.Where(d => !dirs.Any(o => o.Length < d.Length && d.StartsWith(o.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase))).ToList();
+        var folders = top
+            .OrderByDescending(d => NameIs(d, words))
+            .ThenBy(d => d.Count(ch => ch == '\\'))
+            .ThenByDescending(d => { try { return System.IO.Directory.GetLastWriteTime(d); } catch { return DateTime.MinValue; } })
+            .Take(foldersOnly ? max : Math.Min(6, max));
+        return folders.Concat(files).Concat(inside).Distinct(StringComparer.OrdinalIgnoreCase).Take(max).ToList();
+    }
+
+    // ---- Finding outside the index (the whole PC) ----
+    // Windows Search only covers your user folders. For everything else (like folders right on C:\ or another drive)
+    // the monkey keeps its own list of file and folder NAMES, made at lowest priority when you open the chat and
+    // refreshed every 20 minutes while you use it. It's kept in memory only, never saved, never sent anywhere.
+    // Windows, programs, AppData and folders you mark private are never listed or shown.
+
+    sealed class DiskList { public string[] Paths; public bool[] IsDir; public DateTime At; }
+    static volatile DiskList diskList;
+    static int diskBuilding;
+    static readonly HashSet<string> SystemTop = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "Windows", "Program Files", "Program Files (x86)", "ProgramData", "Users", "Documents and Settings", "Recovery", "PerfLogs",
+        "System Volume Information", "System.sav", "OneDriveTemp", "MSOCache", "Intel", "AMD", "NVIDIA", "Drivers", "SWSetup",
+        "inetpub", "Config.Msi", "WindowsApps", "WpSystem", "XboxGames" };
+    // Never shown, wherever they are: app data, keys and passwords, and the bin.
+    static readonly string[] AlwaysPrivate = { "\\AppData\\", "\\.ssh\\", "\\.gnupg\\", "\\.aws\\", "\\.azure\\", "\\.kube\\", "\\.docker\\",
+        "\\$Recycle.Bin\\", "\\System Volume Information\\", "\\Microsoft\\Credentials\\", "\\Microsoft\\Protect\\" };
+
+    internal static bool IsPrivate(string path, List<string> privates)
+    {
+        string p = path.TrimEnd('\\') + "\\";
+        if (AlwaysPrivate.Any(x => p.IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) return true;
+        return privates != null && privates.Any(f => p.StartsWith(f.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Starts (or refreshes) the list in the background.
+    static void WarmDisk()
+    {
+        if (Interlocked.Exchange(ref diskBuilding, 1) == 1) return;
+        var t = new Thread(() => { try { diskList = ScanDisk(); } catch { } finally { diskBuilding = 0; } });
+        t.IsBackground = true;
+        t.Priority = ThreadPriority.Lowest;
+        t.Start();
+    }
+
+    static DiskList Disk()
+    {
+        DiskList d = diskList;
+        if (d != null) { if ((DateTime.UtcNow - d.At).TotalMinutes > 20) WarmDisk(); return d; }
+        WarmDisk();   // not made yet: wait for it (a few seconds, the first time only)
+        var sw = Stopwatch.StartNew();
+        while (diskList == null && diskBuilding == 1 && sw.ElapsedMilliseconds < 20000) Thread.Sleep(50);
+        return diskList;
+    }
+
+    internal static void ForgetDisk() { diskList = null; }
+
+    static DiskList ScanDisk()
+    {
+        var paths = new List<string>();
+        var isDir = new List<bool>();
+        var stack = new Stack<string>();
+        foreach (var drive in System.IO.DriveInfo.GetDrives())
+        {
+            try
+            {
+                if (drive.DriveType != System.IO.DriveType.Fixed || !drive.IsReady) continue;
+                foreach (var d in new System.IO.DirectoryInfo(drive.RootDirectory.FullName).EnumerateDirectories())
+                    if (!SystemTop.Contains(d.Name) && !d.Name.StartsWith("$") && !d.Name.StartsWith(".") && (d.Attributes & System.IO.FileAttributes.System) == 0)
+                        stack.Push(d.FullName);
+            }
+            catch { }
+        }
+        var sw = Stopwatch.StartNew();
+        while (stack.Count > 0 && paths.Count < 500000 && sw.Elapsed.TotalSeconds < 90)
+        {
+            string dir = stack.Pop();
+            if (IsPrivate(dir, null) || SkipDirs.Any(x => (dir + "\\").IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
+            paths.Add(dir); isDir.Add(true);
+            try
+            {
+                foreach (var e in new System.IO.DirectoryInfo(dir).EnumerateFileSystemInfos())
+                {
+                    if ((e.Attributes & System.IO.FileAttributes.Hidden) != 0 && (e.Attributes & System.IO.FileAttributes.System) != 0) continue;
+                    if ((e.Attributes & System.IO.FileAttributes.Directory) != 0)
+                    {
+                        if ((e.Attributes & System.IO.FileAttributes.ReparsePoint) == 0 && !e.Name.StartsWith(".")) stack.Push(e.FullName);
+                    }
+                    else { paths.Add(e.FullName); isDir.Add(false); }
                 }
             }
             catch { }
         }
-        return hits.OrderByDescending(f => f.LastWriteTime).Take(max).Select(f => f.FullName).ToList();
+        return new DiskList { Paths = paths.ToArray(), IsDir = isDir.ToArray(), At = DateTime.UtcNow };
+    }
+
+    static void SearchDisk(List<string> words, List<string> exts, bool foldersOnly, List<string> dirs, List<string> files)
+    {
+        if (words.Count == 0 && exts.Count == 0) return;
+        DiskList d = Disk();
+        if (d == null) return;
+        int nd = 0, nf = 0;
+        for (int i = 0; i < d.Paths.Length && (nd < 100 || nf < 200); i++)
+        {
+            string path = d.Paths[i];
+            if (d.IsDir[i])
+            {
+                if (exts.Count > 0 || words.Count == 0 || nd >= 100) continue;
+                if (StartsWords(System.IO.Path.GetFileName(path), words)) { dirs.Add(path); nd++; }
+            }
+            else
+            {
+                if (foldersOnly || nf >= 200) continue;
+                if (exts.Count > 0 && !exts.Contains(System.IO.Path.GetExtension(path).ToLowerInvariant())) continue;
+                if (StartsWords(System.IO.Path.GetFileName(path), words)) { files.Add(path); nf++; }
+            }
+        }
     }
 
     // Opens a file with its usual app, or shows it selected in File Explorer. "" opens File Explorer.
@@ -1978,10 +2317,10 @@ public class Monkey : Form
         // Action tags ("[do:wave]") are for the monkey, never shown: drop complete ones, and hold back
         // anything that might be the start of one (and trailing spaces) until the next piece arrives.
         streamHeld += piece;
-        streamHeld = Regex.Replace(streamHeld, @"\s*\[do:[a-z_]*\]", "");
+        streamHeld = Tags.Replace(streamHeld, "");
         int cut = streamHeld.Length;
         int open = streamHeld.LastIndexOf('[');
-        if (open >= 0 && streamHeld.IndexOf(']', open) < 0 && streamHeld.Length - open <= 24) cut = open;
+        if (open >= 0 && streamHeld.IndexOf(']', open) < 0 && streamHeld.Length - open <= 48) cut = open;
         while (cut > 0 && char.IsWhiteSpace(streamHeld[cut - 1])) cut--;
         if (cut == 0) return;
         if (!replyStarted) { chat.BeginReply(); replyStarted = true; }
@@ -1990,6 +2329,8 @@ public class Monkey : Form
     }
 
     string streamHeld = "";
+    // Tags for the monkey, never shown: an action ("[do:wave]") or an app to offer ("[app:Excel]").
+    static readonly Regex Tags = new Regex(@"\s*\[(?:do:[a-z_]*|app:[^\]\[\n]{0,40})\]");
 
     void GotReply(bool ok, string reply, string session)
     {
@@ -2007,7 +2348,7 @@ public class Monkey : Form
 #endif
         if (act == Act.Scratch) act = Act.None;
         if (session != null) chatSession = session;
-        string action = null;
+        string action = null, offerApp = null;
         if (ok)
         {
             // An action tag ("[do:wave]") is for the monkey, not for you: take it out and do it.
@@ -2015,9 +2356,11 @@ public class Monkey : Form
             if (m.Success)
             {
                 action = m.Groups[1].Value;
-                reply = Regex.Replace(reply, @"\s*\[do:[a-z_]+\]", "").Trim();
             }
-            string rest = Regex.Replace(streamHeld, @"\s*\[do:[a-z_]*\]?", "").TrimEnd();
+            var am = Regex.Match(reply, @"\[app:([^\]\[\n]{1,40})\]");
+            if (am.Success) offerApp = am.Groups[1].Value.Trim();
+            reply = Tags.Replace(reply, "").Trim();
+            string rest = Regex.Replace(Tags.Replace(streamHeld, ""), @"\s*\[(?:do|app):[^\]\n]*$", "").TrimEnd();
             if (rest.Length > 0 && replyStarted && chat != null && !chat.IsDisposed) chat.AppendReply(rest);
             streamHeld = "";
         }
@@ -2029,6 +2372,7 @@ public class Monkey : Form
             else if (OutOfUsage(reply))
                 chat.AddNote("My brain needs a rest: your Claude usage limit is used up. " + Regex.Replace(reply, @"^Claude Code had a problem:\s*", ""));
             else chat.AddNote(reply);
+            if (offerApp != null) OfferApp(offerApp);
         }
         if (action != null) DoAction(action);
         if (ok)
@@ -2042,6 +2386,15 @@ public class Monkey : Form
         }
         else if (OutOfUsage(reply)) Say(Pick("I'm all out of brain juice for now!", "Too much thinking! I need a rest."), true);
         else Say(Pick("Oops, my brain slipped on a peel.", "Hmm, that didn't work."), true);
+    }
+
+    // Monkey suggested an app: show it as a button to click (only apps from your Start menu, and none of the risky ones).
+    void OfferApp(string name)
+    {
+        List<App> apps = AppMatches(name).Where(a => !RiskyApp.IsMatch(a.Name)).Take(3).ToList();
+        if (apps.Count == 0) return;
+        lastApps = apps; lastListedApps = true;
+        chat.AddApps(apps.Count == 1 ? "Click to open it:" : "Click one to open it:", apps, false);
     }
 
     static bool OutOfUsage(string error) { return Regex.IsMatch(error, @"\blimit\b|quota|credit balance", RegexOptions.IgnoreCase); }
@@ -2113,6 +2466,60 @@ public class Monkey : Form
         {
             shadesOn = shadesTarget; shadesFlipped = true;
             SaveSettings();
+        }
+    }
+
+    // ---- Finding files: whole PC, and folders kept private ----
+    bool findWholePC = true;
+    List<string> privateFolders = new List<string>();
+
+    ToolStripMenuItem FindMenu()
+    {
+        var parent = new ToolStripMenuItem("Finding files");
+        parent.DropDownItems.Add("...");   // filled when opened
+        parent.DropDownOpening += (s, e) =>
+        {
+            parent.DropDownItems.Clear();
+            var whole = new ToolStripMenuItem("Search the whole PC") { Checked = findWholePC, CheckOnClick = true,
+                ToolTipText = "On: also folders outside your user folder (like C:\\Photos). Off: only what Windows Search covers." };
+            whole.CheckedChanged += (s2, e2) =>
+            {
+                findWholePC = whole.Checked;
+                SaveSettings();
+                if (findWholePC) WarmDisk(); else ForgetDisk();   // off: the list of names is thrown away
+            };
+            parent.DropDownItems.Add(whole);
+            parent.DropDownItems.Add(new ToolStripSeparator());
+            parent.DropDownItems.Add("Keep a folder private...", null, (s2, e2) => AddPrivateFolder());
+            if (privateFolders.Count > 0)
+            {
+                parent.DropDownItems.Add(new ToolStripMenuItem("Private (click one to stop hiding it):") { Enabled = false });
+                foreach (string f in privateFolders.ToList())
+                {
+                    string folder = f;
+                    parent.DropDownItems.Add("\U0001F512 " + folder, null, (s2, e2) =>
+                    {
+                        if (MessageBox.Show("Let the monkey find things in this folder again?\n\n" + folder, "Monkey Play",
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                        privateFolders.RemoveAll(x => string.Equals(x, folder, StringComparison.OrdinalIgnoreCase));
+                        SaveSettings();
+                    });
+                }
+            }
+        };
+        return parent;
+    }
+
+    void AddPrivateFolder()
+    {
+        using (var d = new FolderBrowserDialog { Description = "Pick a folder the monkey should never search or show.", ShowNewFolderButton = false })
+        {
+            if (d.ShowDialog() != DialogResult.OK || string.IsNullOrEmpty(d.SelectedPath)) return;
+            string f = d.SelectedPath.TrimEnd('\\');
+            if (f.Length <= 3) { MessageBox.Show("That's a whole drive. Pick a folder on it instead.", "Monkey Play"); return; }
+            if (!privateFolders.Any(x => string.Equals(x, f, StringComparison.OrdinalIgnoreCase))) privateFolders.Add(f);
+            SaveSettings();
+            Say("I won't look in " + System.IO.Path.GetFileName(f) + "!", true);
         }
     }
 
@@ -5382,7 +5789,7 @@ class ChatBox : Form
     bool busy;
 
     // Found files, shown as links in the history: click the name to open it, "folder" to see it in Explorer.
-    sealed class FileLink { public int start, end; public string path; public bool folder; }
+    sealed class FileLink { public int start, end; public string path; public bool folder; public Monkey.App app; }
     readonly List<FileLink> links = new List<FileLink>();
     static readonly Color LinkBlue = Color.FromArgb(20, 90, 200);
     static readonly Color Teal = Color.FromArgb(38, 104, 106), Brown = Color.FromArgb(112, 64, 32);
@@ -5411,7 +5818,8 @@ class ChatBox : Form
         {
             if (e.Button != MouseButtons.Left || history.SelectionLength > 0) return;
             var l = LinkAt(e.Location);
-            if (l != null) Monkey.OpenFile(l.path, l.folder);
+            if (l != null && l.app != null) { Monkey.OpenApp(l.app); AddNote("Opening " + l.app.Name + "..."); }
+            else if (l != null) Monkey.OpenFile(l.path, l.folder);
         };
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = (int)(118 * k), Padding = new Padding((int)(8 * k), (int)(6 * k), (int)(8 * k), (int)(8 * k)) };
@@ -5454,7 +5862,7 @@ class ChatBox : Form
         Controls.Add(history);
         Controls.Add(bottom);
         AddNote("Hi! I'm Monkey. Ask me anything; I only see what you type here (plus your copied text or one file, when you add them).\n"
-            + "To find a file, type \"find\" and its name (like: find GST invoice), or \"open downloads\". I do that right here on your PC, "
+            + "To find a file, type \"find\" and its name (like: find GST invoice). To open an app or folder, type \"open excel\" or \"open downloads\". I do that right here on your PC, "
             + "and none of it is sent anywhere.");
     }
 
@@ -5531,6 +5939,28 @@ class ChatBox : Form
             history.AppendText("\n");
             history.SelectionFont = history.Font;
             history.SelectionColor = Color.Black;
+        }
+        history.ScrollToCaret();
+    }
+
+    // Apps to open: one click each.
+    public void AddApps(string heading, List<Monkey.App> apps, bool header)
+    {
+        history.SelectionStart = history.TextLength;
+        history.SelectionFont = new Font(history.Font, FontStyle.Bold);
+        history.SelectionColor = Brown;
+        if (header) history.AppendText((history.TextLength > 0 ? "\n" : "") + "Monkey:\n");
+        history.SelectionFont = history.Font;
+        history.SelectionColor = Color.Black;
+        history.AppendText(heading + "\n");
+        for (int n = 0; n < apps.Count; n++)
+        {
+            history.SelectionStart = history.TextLength;
+            history.SelectionColor = Color.Gray;
+            history.AppendText((n + 1) + ". ");
+            AppendLink("\u25B6 Open " + apps[n].Name, null, false);
+            links[links.Count - 1].app = apps[n];
+            history.AppendText("\n");
         }
         history.ScrollToCaret();
     }
