@@ -10,8 +10,13 @@ A cartoon monkey in shades and a puffer jacket that lives on your Windows deskto
 - **Reminders:** has a drink of water (every 30 min) and reminds you to rest your eyes (every 20 min). Both intervals can be changed.
 - **Dances** when music is playing (it listens to your speakers' volume level locally, no internet).
 - **Sleeps** at night (10 PM – 6 AM).
+- **Predicts the weather:** warns you an hour or two before rain ("Rain around 4 PM. Take an umbrella!"), and now and then tells you what today looks like, or tomorrow in the evening, with a little weather picture in its speech bubble. Right-click → **What's the weather?** to ask any time. It finds your rough location from your internet address (geojs.io, or ipapi.co as a backup) and gets the forecast from [Open-Meteo](https://open-meteo.com), free with no account. If the location is wrong (a VPN, say), add `weatherAt=11.01,76.97` (your latitude,longitude) to `settings.txt`. Its face follows the weather too: a big smile in the sun, sweating and panting in the heat, a frown in the rain, a wobbly mouth and a sweat drop in a thunderstorm, chattering teeth and a shiver in the cold, and an unimpressed flat mouth under grey skies. Turn it all off with **Weather forecasts**.
 - **Opens browser tabs:** click a tab in Chrome or Edge and the monkey swings over, pulls the old page down off the screen to reveal your tab, then climbs back to its branch.
 - **Blasts closed tabs:** click a tab's close (×) and the monkey flings a banana at it. BOOM: the tab flies apart and closes.
+- **Chats with you:** double-click the monkey (or right-click → **Ask Monkey...**) to ask it anything. Answers come from Claude Code installed on your PC (`npm install -g @anthropic-ai/claude-code`, signed in to your Claude account), locked down with no tools: it can't read your files, run commands or browse, and only sees what you type, plus your copied text when you tick **Use copied text**. Ask it to wave, sit or eat a banana and it does. **Monkey's brain** picks Fast (Haiku), Balanced (Sonnet) or Smartest (Opus). **New chat** starts over.
+- **Tells the time:** on the hour it waves and says what time it is (not while it's asleep or you're away). Turn it off with **Hourly chime**.
+- **Finds your files:** in the chat, type `find` and part of a file's name (`find GST invoice`, `find sales pdf`), and the monkey lists matching files, newest first. Click a name to open it, or **folder** to see it in File Explorer, or type `open 2`. `open downloads` (or documents, desktop, pictures...) opens that folder. This uses the Windows Search index on your PC; none of it is sent to Claude.
+- **Reads a file you pick:** the **File...** button in the chat attaches one text, CSV, Word, Excel or PowerPoint file to your next question ("what's the total here?"). Only that file is sent, only that once.
 - **Stays out of the way:** stays on top of other windows, hides during fullscreen video and games, and can be put away at any time.
 - **Works with several screens:** choose which screen it lives on; it's drawn crisp at that screen's scaling (100%, 125%, 150%...).
 
@@ -21,6 +26,7 @@ A cartoon monkey in shades and a puffer jacket that lives on your Windows deskto
 | --- | --- |
 | Drag it | Stretch its tail; let go to fling it |
 | Tap it | It gets bumped and grins |
+| Double-click it | Opens the chat |
 | Right-click it | Menu: settings, hide, start with Windows, quit |
 | Hold **M** (about ¾ s) anywhere | Hide the monkey, or bring it back |
 | Start the app again | Brings the monkey back if it's hidden |
@@ -28,7 +34,7 @@ A cartoon monkey in shades and a puffer jacket that lives on your Windows deskto
 
 Holding M types one "m" if you're in a text box, and M doesn't key-repeat while held.
 
-Right-click menu options: **Monkey opens my tabs**, **Water & blink reminders**, **Water every**, **Eye break every**, **Hide during fullscreen**, **Live on screen**, **Monkey blasts closed tabs**, **Start with Windows**, **Hide monkey**, **Quit monkey**. Choices are saved in `%APPDATA%\MonkeyPlay\settings.txt`.
+Right-click menu options: **Ask Monkey...**, **Monkey's brain**, **Monkey opens my tabs**, **Water & blink reminders**, **Water every**, **Eye break every**, **What's the weather?**, **Weather forecasts**, **Hourly chime**, **Hide during fullscreen**, **Live on screen**, **Monkey blasts closed tabs**, **Start with Windows**, **Hide monkey**, **Quit monkey**. Choices are saved in `%APPDATA%\MonkeyPlay\settings.txt`.
 
 ## Download
 
@@ -55,6 +61,8 @@ Extra arguments are passed to the compiler. These switches make test builds that
 | `-define:HABITDEMO` | Runs through its habits one after another, starting with the banana |
 | `-define:DRINKDEMO` | Water break right after starting |
 | `-define:SITDEMO` | Goes and sits on the branch right after starting |
+| `-define:WEATHERDEMO` | Checks the weather right after starting, gives a forecast every few seconds, and shows each weather face in turn |
+| `-define:CHIMEDEMO` | Pretends it just turned 4 o'clock a few seconds after starting, to show the hourly chime |
 | `-define:DEMO` | Visits a spot on the browser tab bar and pulls the page down (never clicks anything) |
 | `-define:HOLDDEMO` | With `DEMO`: keeps holding the tab |
 | `-define:BLASTDEMO` | Blasts a pretend tab on the tab bar (never clicks anything) |
@@ -67,5 +75,5 @@ For example: `build.cmd -define:SITDEMO`
 ## Notes
 
 - To hold your tab clicks and to notice hold-M, the monkey watches the mouse and keyboard system-wide (nothing is recorded or sent anywhere). Because the exe is unsigned, some antivirus tools may flag that.
-- Battery and CPU: while visible it uses roughly 20-25% of one CPU core (it runs at 30 frames a second when calm, 60 when moving fast, and fewer on battery). Hidden (hold M), it uses almost nothing.
+- Battery and CPU: while visible it uses roughly 15% of one CPU core (it runs at 12-20 frames a second when calm, 60 when moving fast, and fewer on battery), at low priority so your own apps always come first. Hidden (hold M), it uses almost nothing.
 - It lives on your main screen unless you pick another under **Live on screen**.
