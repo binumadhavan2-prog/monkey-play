@@ -139,6 +139,11 @@ public class Monkey : Form
     enum Act { None, Scratch, Look, Pump, Climb, Wave, Eat, Drink, EyeRest, Throw, Shades }
     Act act = Act.None, lastAct = Act.None;
     double actStart, actLen, nextAct = 5, waveCooldown;
+    // Its own movements (swinging, habits, sitting) run on a clock that goes at 82.5% speed, so it's calm to watch.
+    // Going to your tab, throwing a banana, dancing and being dragged run in real time; timers and reminders always do.
+    const double CalmSpeed = 0.825;
+    double motionNow;
+    double ActAge { get { return motionNow - actStart; } }
     float actW;          // 0..1, eases each habit in and out
     int waveSide = 1;
 
@@ -853,7 +858,7 @@ public class Monkey : Form
         get
         {
             if (!EyeRest) return false;
-            double ap = clock.Elapsed.TotalSeconds - actStart;
+            double ap = ActAge;
             foreach (double b in RestBlinks) if (ap > b && ap < b + 0.28) return true;
             return false;
         }
@@ -3497,7 +3502,7 @@ public class Monkey : Form
 
     void UpdateShades(double now)
     {
-        if (!shadesFlipped && (act != Act.Shades || now - actStart >= ShadesSwap))
+        if (!shadesFlipped && (act != Act.Shades || ActAge >= ShadesSwap))
         {
             shadesOn = shadesTarget; shadesFlipped = true;
             SaveSettings();
@@ -4458,7 +4463,10 @@ public class Monkey : Form
         double dt = Math.Min(now - last, 0.12);   // allows for the slowest frame rate (10 a second), not for long stalls
         last = now;
         if (dt <= 0) return;
-        t += dt;
+        bool calmMotion = mode == Mode.Home && !grabbed && blastPhase == 0 && danceW < 0.05f && act != Act.Throw;
+        double mdt = calmMotion ? dt * CalmSpeed : dt;   // its own movements, a little slower
+        motionNow += mdt;
+        t += mdt;
         frameDt = dt;
         UpdateAnchor(now);
         UpdateSleep(now, dt);
@@ -4479,13 +4487,13 @@ public class Monkey : Form
         if (act == Act.Climb)
         {
             // Climb up its own tail, hang there a moment, then let go and drop.
-            double cp = now - actStart;
+            double cp = ActAge;
             double top = perch == Perch.Up ? 30 : 58;   // climbs right up to the branch when it's going to sit
             if (cp < ClimbTop) ropeTarget = L - (L - top) * cp / ClimbTop;
             else if (cp < ClimbLetGo) ropeTarget = top;
             else ropeRate = 16;
         }
-        rope += (ropeTarget - rope) * Ease(ropeRate, dt);
+        rope += (ropeTarget - rope) * Ease(ropeRate, mdt);
 
         if (PerchedPose)
         {
@@ -4505,8 +4513,8 @@ public class Monkey : Form
         }
         else
         {
-            int steps = (int)Math.Ceiling(dt / 0.004);
-            double h = dt / steps;
+            int steps = (int)Math.Ceiling(mdt / 0.004);
+            double h = mdt / steps;
             for (int i = 0; i < steps; i++)
             {
                 double r = Math.Max(1, Math.Sqrt(x * x + y * y));
@@ -4524,7 +4532,7 @@ public class Monkey : Form
             }
         }
 
-        UpdateBranchBend(dt);
+        UpdateBranchBend(mdt);
         CheckFullscreen(now);
         CheckPower(now);
         if (hideAt >= 0 && now >= hideAt) { hideAt = -1; hiddenByUser = true; ApplyVisibility(); SaveSettings(); }
@@ -4540,8 +4548,8 @@ public class Monkey : Form
         bool hp = HandPose;
         if (hp != prevHand) { flip += hp ? -Math.PI : Math.PI; prevHand = hp; }
         if (!hp) mirror = 1;
-        int springSteps = (int)Math.Ceiling(dt / (1 / 60.0));
-        double sh = dt / springSteps;
+        int springSteps = (int)Math.Ceiling(mdt / (1 / 60.0));
+        double sh = mdt / springSteps;
         double angTarget = Math.Atan2(x, y);
         for (int i = 0; i < springSteps; i++)
         {
@@ -4558,7 +4566,7 @@ public class Monkey : Form
         float turn = Math.Max(-3.5f, Math.Min(3.5f, lookX * 1.3f));
         if (ShownAct == Act.Look)
         {
-            double lp = now - actStart;
+            double lp = ActAge;
             turn += (lp < 1.0 ? -5 : lp < 2.1 ? 5 : 0) * actW;
         }
         faceShift += (turn * (1 - sleepW) - faceShift) * Ease(8, dt);
@@ -4760,14 +4768,14 @@ public class Monkey : Form
     void StartAct(Act a, double len, double now)
     {
         act = lastAct = a;
-        actStart = now;
+        actStart = motionNow;
         actLen = len;
     }
 
     void UpdateHabits(double now, double dt)
     {
         bool calm = mode == Mode.Home && !grabbed && sleepW < 0.05f && danceW < 0.05f && perch != Perch.Over && perch != Perch.Down;
-        if (act != Act.None && (now - actStart > actLen || !calm)) act = Act.None;
+        if (act != Act.None && (ActAge > actLen || !calm)) act = Act.None;
         actW += ((act == Act.None ? 0 : 1) - actW) * Ease(7, dt);
 
         // Health reminders: when it's home, awake and not busy with something else.
@@ -5251,7 +5259,7 @@ public class Monkey : Form
     {
         get
         {
-            double ap = clock.Elapsed.TotalSeconds - actStart;
+            double ap = ActAge;
             return ShownAct == Act.Shades && actW > 0.3f && ap >= ShadesLift && ap < ShadesSwap + 0.05;
         }
     }
@@ -5346,7 +5354,7 @@ public class Monkey : Form
     void StartSit(double now)
     {
         perch = Perch.Up;
-        perchStart = now;
+        perchStart = motionNow;
         StartAct(Act.Climb, ClimbTop + 0.3, now);   // first, hand over hand up the tail
     }
 
@@ -5355,14 +5363,14 @@ public class Monkey : Form
         if (perch == Perch.None) return;
         if (mode != Mode.Home && PerchedPose) { LeavePerchNow(now); return; }   // off to a tab
         bool leave = mode != Mode.Home || grabbed || musicOn || sleepW > 0.3f;
-        double el = now - perchStart;
+        double el = motionNow - perchStart;
         switch (perch)
         {
             case Perch.Up:
                 if (leave || act != Act.Climb) { perch = Perch.None; break; }
                 if (el >= ClimbTop)
                 {
-                    perch = Perch.Over; perchStart = now;
+                    perch = Perch.Over; perchStart = motionNow;
                     perchFrom = new PointF((float)x, (float)y);
                     act = Act.None;
                 }
@@ -5371,7 +5379,7 @@ public class Monkey : Form
                 perchK = Smooth(el / OverTime);
                 if (el >= OverTime)
                 {
-                    perch = Perch.Sit; perchStart = now; perchK = 1;
+                    perch = Perch.Sit; perchStart = motionNow; perchK = 1;
                     sitUntil = now + 15 + rnd.NextDouble() * 20;
 #if SITDEMO
                     sitUntil = now + 4;
@@ -5383,7 +5391,7 @@ public class Monkey : Form
                 }
                 break;
             case Perch.Sit:
-                if (leave || (now >= sitUntil && act == Act.None)) { perch = Perch.Down; perchStart = now; perchFrom = new PointF(0, 36); }
+                if (leave || (now >= sitUntil && act == Act.None)) { perch = Perch.Down; perchStart = motionNow; perchFrom = new PointF(0, 36); }
                 break;
             case Perch.Down:
                 perchK = 1 - Smooth(el / OverTime);
@@ -5834,7 +5842,7 @@ public class Monkey : Form
 #endif
 
         // A pocket on the hip, with its snack sticking out (until it's taken out to eat).
-        bool bananaTaken = shown == Act.Eat && actW > 0.05f && clock.Elapsed.TotalSeconds - actStart >= GrabTime;
+        bool bananaTaken = shown == Act.Eat && actW > 0.05f && ActAge >= GrabTime;
         // It snacks all day, so the pocket is stuffed with a bunch; it pulls the middle one out to eat.
         // It never moves, so it's drawn once (at double size, to stay sharp) for each way it can look.
         bool showBananas = perchK < 0.5f;   // sitting, the jacket's upside down, so they're tucked right in
@@ -5859,8 +5867,7 @@ public class Monkey : Form
 #endif
 
         // The water bottle's holder, below the pocket, with the bottle's cap peeking out (until it's taken).
-        bool bottleOut = shown == Act.Drink && actW > 0.3f && clock.Elapsed.TotalSeconds - actStart >= DkReach
-                         && clock.Elapsed.TotalSeconds - actStart < DkIn;
+        bool bottleOut = shown == Act.Drink && actW > 0.3f && ActAge >= DkReach && ActAge < DkIn;
         Bitmap holster = Sprite(bottleOut ? "holster0" : "holster1", 40, 70, -12, -28, hg =>
         {
             hg.ScaleTransform(2, 2);
@@ -5874,7 +5881,7 @@ public class Monkey : Form
         bool sitting = perch == Perch.Sit;
         if (sitting) { restL = new PointF(-24, -1); restR = new PointF(24, -1); }   // hands on the branch beside it
         PointF tL = restL, tR = restR;
-        double ap = clock.Elapsed.TotalSeconds - actStart;
+        double ap = ActAge;
         if (shown == Act.Scratch)
             tR = Face(new PointF(23, 54 + (float)Math.Sin(t * 22) * 3));                // scratching its head
         if (shown == Act.Throw)
