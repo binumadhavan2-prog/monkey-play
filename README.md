@@ -55,6 +55,10 @@ Android only lets touches pass through an app's overlay when it's at most 80% op
 
 It doesn't have the Windows features that need a PC: the browser tab tricks, the chat with Claude, finding files, opening apps, the laptop check-up and the weather.
 
+### Download for Android
+
+On your phone, open **[Monkey-Play.apk](https://github.com/binumadhavan2-prog/monkey-play/releases/latest/download/Monkey-Play.apk)** and tap it to install. Android asks once to allow installing apps from your browser; allow it. It isn't from the Play Store, so Play Protect may call it an unknown app: tap **Install anyway**. Then open **Monkey Play**, tap **Allow Monkey over other apps**, switch it on and come back.
+
 ### Build the Android app
 
 You need Java (JDK 17 or newer) and the Android SDK's command-line tools with `platforms;android-34` and `build-tools;34.0.0` (in `%LOCALAPPDATA%\Android\Sdk`, or set `ANDROID_HOME`). No Android Studio or Gradle.
