@@ -41,6 +41,30 @@ Holding M types one "m" if you're in a text box, and M doesn't key-repeat while 
 
 Right-click menu options: **Ask Monkey...**, **Monkey's brain**, **Finding files**, **Delete saved chats after**, **Monkey opens my tabs**, **Water & blink reminders**, **Water every**, **Eye break every**, **What's the weather?**, **Laptop check-up**, **How's my battery?**, **Battery tips & reminders**, **Weather forecasts**, **Hourly chime**, **Hide during fullscreen**, **Live on screen**, **Monkey blasts closed tabs**, **Start with Windows**, **Hide monkey**, **About Monkey Play**, **Quit monkey**. Choices are saved in `%APPDATA%\MonkeyPlay\settings.txt`.
 
+## Android
+
+The same monkey, on your phone (Android 8 or newer). It hangs from a branch at the top-right of the screen, over whatever app you're using, and your touches still reach the app underneath, except on the monkey itself.
+
+- **Drag it** and let go to fling it. **Tap it** to make it grin. **Double-tap** for the time and battery. **Hold it** to open its settings.
+- **Tilt your phone** and it swings that way. **Shake it** and it gets thrown about.
+- Its eyes follow your finger, and it scratches its head, looks around, swings higher, climbs its tail and waves.
+- It dances and sings when music is playing, sleeps at night (10 PM – 6 AM), waves when you unlock the phone, reminds you about water and eye breaks, warns you at 20% and 10% battery, and says the time on the hour.
+- The notification lets you hide it or quit. Settings: size, tilt, each reminder, and starting with the phone.
+
+Android only lets touches pass through an app's overlay when it's at most 80% opaque, so the monkey is a little see-through on the phone.
+
+It doesn't have the Windows features that need a PC: the browser tab tricks, the chat with Claude, finding files, opening apps, the laptop check-up and the weather.
+
+### Build the Android app
+
+You need Java (JDK 17 or newer) and the Android SDK's command-line tools with `platforms;android-34` and `build-tools;34.0.0` (in `%LOCALAPPDATA%\Android\Sdk`, or set `ANDROID_HOME`). No Android Studio or Gradle.
+
+```
+android\build.cmd
+```
+
+This makes `android\Monkey Play.apk`. Copy it to your phone and open it to install (allow installing from that app when asked), or with USB debugging on: `adb install -r "android\Monkey Play.apk"`. Open **Monkey Play**, tap **Allow Monkey over other apps**, switch it on, and come back.
+
 ## Download
 
 Get `Monkey-Play.exe` from the [latest release](https://github.com/binumadhavan2-prog/monkey-play/releases/latest) and run it. There's nothing to install.

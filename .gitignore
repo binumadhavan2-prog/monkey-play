@@ -1,2 +1,7 @@
 # Built by build.cmd
 *.exe
+
+# Built by android/build.cmd
+*.apk
+*.apk.idsig
+android/out/
