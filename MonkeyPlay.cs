@@ -53,6 +53,8 @@ public class Monkey : Form
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr hMod, uint thread);
     [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] static extern bool PostThreadMessage(uint thread, uint msg, IntPtr w, IntPtr l);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
@@ -1938,12 +1940,66 @@ public class Monkey : Form
     HookProc hookProc;
     IntPtr hook;
     volatile bool pullTabs = true;
-    volatile bool swallowUp;
     bool hasPending;
-    int swallowAt;   // when the release started being held back (Environment.TickCount)
 
-    // Holds back the release that goes with a click it's taking over.
-    void HoldUp() { swallowUp = true; swallowAt = Environment.TickCount; }
+    // A press on a tab or its close (x), held back until it's clear what it is: let go there and the monkey
+    // takes the click; move away first and it's a drag (or a change of mind), which goes to the browser.
+    // All of this lives on the hook thread.
+    enum Held { None, Tab, Close }
+    Held held;
+    RectangleF heldTab;
+    Point heldAt;
+    int heldSince;   // Environment.TickCount
+    const int DragSlop = 6;   // pixels the mouse can wander and still be a click
+    volatile bool dragDue;
+    Point dragFrom, dragTo;
+    uint hookThreadId;
+
+    void Hold(Held what, RectangleF tab, Point at) { held = what; heldTab = tab; heldAt = at; heldSince = Environment.TickCount; }
+
+    // Your click on a tab's close (x), once you've let go on it: the monkey throws a banana at it.
+    void CloseClicked(RectangleF tab, Point cp)
+    {
+        // A throw that never finished: give up on it; its tab and this one close the plain way.
+        if ((blastPhase == 1 || blastPhase == 2) && clock.Elapsed.TotalSeconds - blastStart > BlastMaxTime)
+        {
+            blastPhase = 0;
+            Point owed = blastClick;
+            BeginInvoke(new Action(() => { AbandonBlast(); ReplayClick(owed); ReplayClick(cp); }));   // its window belongs to the main thread
+            return;
+        }
+        // Clicked the same x again while the banana's on its way: one banana, one tab.
+        if ((blastPhase == 1 || blastPhase == 2) && tab == blastTab) return;
+        if ((blastPhase == 0 || blastPhase == 3) && mode == Mode.Home)
+        {
+            BeginInvoke(new Action(() =>
+            {
+                try { StartBlast(tab, cp); }
+                catch (Exception ex) { LogError("blast start", ex); AbandonBlast(); ReplayClick(cp); }   // no banana this time, but the tab still closes
+            }));
+            return;
+        }
+        if (!hasQueuedBlast)
+        {
+            // Off at a tab, or a banana's already flying: this one goes as soon as it can.
+            queuedTab = tab; queuedClick = cp; queuedAt = clock.Elapsed.TotalSeconds;
+            hasQueuedBlast = true;
+            return;
+        }
+        BeginInvoke(new Action(() => ReplayClick(cp)));   // one's already waiting: this tab just closes
+    }
+
+    // A drag that started on a tab: press where it began, then move to where the mouse is now.
+    static void ReplayDrag(Point from, Point to)
+    {
+#if DEMO || BLASTDEMO || CLICKTEST
+        return;   // test build never clicks anything
+#endif
+        Rectangle b = SystemInformation.VirtualScreen;
+        const uint MOVE = 0x1, DOWN = 0x2, ABS = 0x8000, VDESK = 0x4000;
+        mouse_event(MOVE | ABS | VDESK | DOWN, (int)((from.X - b.Left) * 65535.0 / Math.Max(1, b.Width - 1)), (int)((from.Y - b.Top) * 65535.0 / Math.Max(1, b.Height - 1)), 0, UIntPtr.Zero);
+        mouse_event(MOVE | ABS | VDESK, (int)((to.X - b.Left) * 65535.0 / Math.Max(1, b.Width - 1)), (int)((to.Y - b.Top) * 65535.0 / Math.Max(1, b.Height - 1)), 0, UIntPtr.Zero);
+    }
     Point pendingPt;
     double pendingSince;
 
@@ -2063,15 +2119,17 @@ public class Monkey : Form
         var shooter = new System.Windows.Forms.Timer { Interval = 150 };
         shooter.Tick += (s, e) =>
         {
-            if (canvas == null || ++shot > 70) { if (shot > 70) shooter.Stop(); return; }
-            using (var copy = new Bitmap(canvas.Bmp.Width, canvas.Bmp.Height))
-            {
-                using (var cg = Graphics.FromImage(copy)) { cg.Clear(Color.White); cg.DrawImage(canvas.Bmp, 0, 0); }
-                copy.Save(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_frame_" + shot.ToString("00") + ".png"));
-            }
+            if (++shot > 70) { shooter.Stop(); return; }
+            if (canvas != null && !Resting)   // a picture only while it's being drawn; the log line either way
+                using (var copy = new Bitmap(canvas.Bmp.Width, canvas.Bmp.Height))
+                {
+                    using (var cg = Graphics.FromImage(copy)) { cg.Clear(Color.White); cg.DrawImage(canvas.Bmp, 0, 0); }
+                    copy.Save(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_frame_" + shot.ToString("00") + ".png"));
+                }
             System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_frame_log.txt"),
                 shot.ToString("00") + " act=" + act + " shown=" + ShownAct + " age=" + ActAge.ToString("F2") + " actW=" + actW.ToString("F2") + " dance=" + danceW.ToString("F2")
-                + " sleep=" + sleepW.ToString("F2") + " mode=" + mode + " perch=" + perch + Environment.NewLine);
+                + " sleep=" + sleepW.ToString("F2") + " mode=" + mode + " perch=" + perch + " music=" + musicOn + " gaps=" + gapShare.ToString("F2")
+                + " song=" + songShown + "/" + songLines.Count + (Resting ? " (hidden)" : "") + Environment.NewLine);
         };
         shooter.Start();
 #endif
@@ -2154,6 +2212,9 @@ public class Monkey : Form
         // Test build: blast a pretend tab on the tab bar a moment after starting (never clicks anything).
         var blastDemo = new System.Windows.Forms.Timer { Interval = 2000 };
         blastDemo.Tick += (s, e) => { blastDemo.Stop(); StartBlast(new RectangleF(home.X - 700, 8, 220, 34), new Point(-1, -1)); };
+#if DANCEDEMO || SINGDEMO
+        blastDemo.Interval = 5000;   // once it's dancing, or in the middle of its song
+#endif
         blastDemo.Start();
 #endif
 
@@ -2231,6 +2292,9 @@ public class Monkey : Form
             pendingSince = clock.Elapsed.TotalSeconds;
             GoToTab(new PointF(pendingTab.X + 20, pendingTab.Bottom - 6));
         };
+#if DANCEDEMO
+        demo.Interval = 5000;   // with music: once it's dancing
+#endif
         demo.Start();
 #endif
         var listener = new Thread(ListenToAudio);
@@ -2428,45 +2492,45 @@ public class Monkey : Form
 #endif
             if (!injected)
             {
-                if (msg == 0x202 /* LBUTTONUP */ && swallowUp) { swallowUp = false; return (IntPtr)1; }
-                if (msg == 0x201) swallowUp = false;   // a new press: the release it was waiting for is long gone
-                RectangleF tab;
-                if (msg == 0x201 && blastTabs && !grabbed && FindCloseButton(info.pt, out tab))
+                var pt = new Point(info.pt.x, info.pt.y);
+                if (held != Held.None)
                 {
-                    var cp = new Point(info.pt.x, info.pt.y);
-                    // A throw that never finished: give up on it, and this click closes the tab the plain way.
-                    if ((blastPhase == 1 || blastPhase == 2) && clock.Elapsed.TotalSeconds - blastStart > BlastMaxTime)
+                    // A press it's holding: is it a click, or the start of a drag?
+                    if (msg == 0x200 /* MOUSEMOVE */ && held == Held.Tab && Math.Abs(pt.X - heldAt.X) + Math.Abs(pt.Y - heldAt.Y) > DragSlop)
                     {
-                        blastPhase = 0;
-                        Point owed = blastClick;   // the stuck throw's own tab still gets closed
-                        BeginInvoke(new Action(() => { AbandonBlast(); ReplayClick(owed); }));   // its window belongs to the main thread
-                        return CallNextHookEx(hook, code, w, l);
+                        // Dragging the tab (to move it, or out into a window of its own): the browser gets the
+                        // press after all, then this movement, and the rest of the drag goes straight through.
+                        held = Held.None;
+                        dragFrom = heldAt; dragTo = pt; dragDue = true;
+                        PostThreadMessage(hookThreadId, 0x0400 /* WM_USER: wake up */, IntPtr.Zero, IntPtr.Zero);
+                        return (IntPtr)1;
                     }
-                    // Clicked the same x again while the banana's on its way: one banana, one tab.
-                    if ((blastPhase == 1 || blastPhase == 2) && tab == blastTab) { HoldUp(); return (IntPtr)1; }
-                    if ((blastPhase == 0 || blastPhase == 3) && mode == Mode.Home)
+                    if (msg == 0x202 /* LBUTTONUP */)
                     {
-                        HoldUp();
-                        BeginInvoke(new Action(() =>
+                        Held h = held;
+                        held = Held.None;
+                        RectangleF still;
+                        if (h == Held.Tab)
                         {
-                            try { StartBlast(tab, cp); }
-                            catch { AbandonBlast(); ReplayClick(cp); }   // no banana this time, but the tab still closes
-                        }));
-                        return (IntPtr)1;
+                            RectangleF tab = heldTab;
+                            Point at = heldAt;
+                            BeginInvoke(new Action(() => PullTab(tab, at)));
+                        }
+                        // Let go on the same x: it's closed. Slid off it first: nothing, just like the browser.
+                        else if (FindCloseButton(info.pt, out still) && still == heldTab) CloseClicked(heldTab, heldAt);
+                        return (IntPtr)1;   // the release that goes with the press it kept
                     }
-                    if (!hasQueuedBlast)
-                    {
-                        // Off at a tab, or a banana's already flying: this one goes as soon as it can.
-                        HoldUp();
-                        hasQueuedBlast = true; queuedTab = tab; queuedClick = cp; queuedAt = clock.Elapsed.TotalSeconds;
-                        return (IntPtr)1;
-                    }
+                    if (msg == 0x201) held = Held.None;   // a new press: the release it was waiting for never came
                 }
-                if (msg == 0x201 /* LBUTTONDOWN */ && pullTabs && !grabbed && mode != Mode.PullDown && FindTab(info.pt, out tab))
+                RectangleF found;
+                if (msg == 0x201 && blastTabs && !grabbed && FindCloseButton(info.pt, out found))
                 {
-                    HoldUp();
-                    var p = new Point(info.pt.x, info.pt.y);
-                    BeginInvoke(new Action(() => PullTab(tab, p)));
+                    Hold(Held.Close, found, pt);
+                    return (IntPtr)1;
+                }
+                if (msg == 0x201 /* LBUTTONDOWN */ && pullTabs && !grabbed && mode != Mode.PullDown && FindTab(info.pt, out found))
+                {
+                    Hold(Held.Tab, found, pt);
                     return (IntPtr)1;
                 }
             }
@@ -3745,8 +3809,32 @@ public class Monkey : Form
     string pendingAction;      // asked for while it was busy, dozing or dancing: done when it can (or dropped)
     double pendingActionUntil;
 
+    List<string> songLeft;   // the rest of a song a tab job cut short
+    double songLeftUntil;
+
+    // Off to do a tab job in the middle of a song: remember where it was (the line it was singing, again).
+    void PauseSong()
+    {
+        if (act != Act.Sing || songLines.Count == 0) return;
+        int from = Math.Max(0, songShown - 1);
+        if (from >= songLines.Count) return;
+        songLeft = songLines.GetRange(from, songLines.Count - from);
+        songLeftUntil = clock.Elapsed.TotalSeconds + 20;
+    }
+
     void UpdatePendingAction(double now)
     {
+        if (songLeft != null && pendingAction == null)
+        {
+            // Back from the job: carry on with the song.
+            if (now > songLeftUntil) songLeft = null;
+            else if (act == Act.None && blastPhase == 0 && !hasQueuedBlast && FreeFor(true))
+            {
+                songLines = songLeft; songLeft = null;
+                DoAction("sing");
+                Say(Pick("Now, where was I? ♪", "As I was singing... ♫"), true, 1.2);
+            }
+        }
         if (pendingAction == null) return;
         if (now > pendingActionUntil) pendingAction = null;
         else if (FreeFor(pendingAction == "sing")) DoAction(pendingAction);
@@ -4032,6 +4120,7 @@ public class Monkey : Form
         float ddx = blastAt.X - hx, ddy = blastAt.Y - hy, len = Math.Max(1, (float)Math.Sqrt(ddx * ddx + ddy * ddy));
         throwDir = new PointF(ddx / len, ddy / len);
         handScreen = new PointF(hx, hy);
+        PauseSong();
         StartAct(Act.Throw, 0.85, now);
         actW = 1;   // the arm starts from rest anyway, so it can take the throw at full stretch straight away
         grinTime = 0.9;
@@ -4334,6 +4423,7 @@ public class Monkey : Form
 
     void StartTravel(PointF to, Mode m)
     {
+        PauseSong();   // off to a tab mid-song: it carries on when it's back
         travelFrom = anchor; travelTo = to;
         travelStart = clock.Elapsed.TotalSeconds;
         double dist = Math.Sqrt(Math.Pow(to.X - anchor.X, 2) + Math.Pow(to.Y - anchor.Y, 2));
@@ -4610,6 +4700,7 @@ public class Monkey : Form
         // thread of its own that does nothing else; the animation never slows your cursor down.
         var t = new Thread(() =>
         {
+            hookThreadId = GetCurrentThreadId();
             hookProc = OnMouseHook;   // keep references so they are not garbage collected
             keyProc = OnKeyHook;
             Hook();
@@ -4623,10 +4714,12 @@ public class Monkey : Form
                 while (PeekMessage(out m, IntPtr.Zero, 0, 0, 1 /* PM_REMOVE */)) if (m.msg == 0x12 /* WM_QUIT */) quit = true;
                 if (quit) break;
                 CheckHoldM();
-                // A release held back for more than a few seconds never came (Windows dropped the hook mid-click):
-                // forget it, or it would stop the hooks ever being put back.
-                if (swallowUp && Environment.TickCount - swallowAt > 3000) swallowUp = false;
-                if (Environment.TickCount - hookedAt > 30000 && !mDown && !mHeld && !swallowUp
+                // A tab press turned into a drag: hand it to the browser (outside the hook, so it isn't kept waiting).
+                if (dragDue) { dragDue = false; quietUntil = clock.Elapsed.TotalSeconds + 2; ReplayDrag(dragFrom, dragTo); }
+                // A press held for ages whose release never came (Windows dropped the hook mid-click): forget it,
+                // or it would stop the hooks ever being put back.
+                if (held != Held.None && Environment.TickCount - heldSince > 10000) held = Held.None;
+                if (Environment.TickCount - hookedAt > 30000 && !mDown && !mHeld && held == Held.None
                     && GetAsyncKeyState(0x01) >= 0 && GetAsyncKeyState(0x02) >= 0) Hook();   // not mid-click
             }
         });
@@ -4943,17 +5036,75 @@ public class Monkey : Form
         if (!Resting) Render();   // nothing to draw while it's put away or nobody can see it
     }
 
+    // Speech (a call, a talk, a video of someone explaining) is full of tiny gaps between words; music hardly has
+    // any. The share of near-silent moments over the last 3 seconds tells them apart.
+    readonly bool[] gapRing = Enumerable.Repeat(true, 150).ToArray();   // starts out as silence
+    int gapPos, gapCount = 150;
+    volatile float gapShare = 1;
+
+    void NoteGap(float level)
+    {
+        bool gap = level < 0.02f;
+        if (gapRing[gapPos]) gapCount--;
+        gapRing[gapPos] = gap;
+        if (gap) gapCount++;
+        gapPos = (gapPos + 1) % gapRing.Length;
+        gapShare = gapCount / (float)gapRing.Length;
+    }
+
+    // Whether an app is using the microphone right now (you're on a call): Windows notes it for the
+    // microphone privacy icon, with a stop time of 0 while it's in use.
+    static bool MicInUse()
+    {
+        try
+        {
+            using (var root = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"))
+            {
+                if (root == null) return false;
+                if (AnyMicInUse(root)) return true;
+                using (var np = root.OpenSubKey("NonPackaged")) if (np != null && AnyMicInUse(np)) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    static bool AnyMicInUse(Microsoft.Win32.RegistryKey key)
+    {
+        foreach (string name in key.GetSubKeyNames())
+        {
+            if (name == "NonPackaged") continue;
+            using (var app = key.OpenSubKey(name))
+            {
+                if (app == null) continue;
+                object start = app.GetValue("LastUsedTimeStart"), stop = app.GetValue("LastUsedTimeStop");
+                if (start is long && (long)start > 0 && stop is long && (long)stop == 0) return true;
+            }
+        }
+        return false;
+    }
+
+    bool micBusy;
+    double nextMicCheck, musicOffAt = -1000;
+
     // Reads how loud the speakers are, about 50 times a second (background thread).
     void ListenToAudio()
     {
-#if DANCEDEMO
-        // Test build: pretend a song at 120 beats per minute is playing.
+#if DANCEDEMO || SPEECHDEMO
+        // Test build: pretend a song at 120 beats per minute is playing (or, with SPEECHDEMO, someone talking:
+        // syllables with short gaps between words and longer ones between sentences).
         var demo = Stopwatch.StartNew();
         while (true)
         {
             Thread.Sleep(20);
+#if SPEECHDEMO
+            double st = demo.Elapsed.TotalSeconds % 2.6, wt = st % 0.42;
+            audioLevel = st > 2.2 || wt > 0.3 ? 0.004f : (float)(0.2 + 0.25 * Math.Abs(Math.Sin(wt * 40)));
+#else
             double bt = demo.Elapsed.TotalSeconds % 0.5;
             audioLevel = (float)(0.15 + 0.6 * Math.Exp(-bt * 14));
+#endif
+            NoteGap(audioLevel);
         }
 #else
         IAudioMeterInformation meter = null;
@@ -4981,6 +5132,7 @@ public class Monkey : Form
                 float pk;
                 if (meter.GetPeakValue(out pk) != 0) { meter = null; audioLevel = 0; continue; }
                 audioLevel = pk;
+                NoteGap(pk);
             }
             catch { meter = null; audioLevel = 0; retryAt = sw.Elapsed.TotalSeconds + 3; }
         }
@@ -4993,15 +5145,24 @@ public class Monkey : Form
 
         // Music = sound that keeps going for over a second (so a notification beep doesn't count).
         if (lv > 0.015f) soundSecs = Math.Min(3, soundSecs + dt); else soundSecs = Math.Max(0, soundSecs - dt * 1.5);
-        if (!musicOn && soundSecs > 1.2)
+        if (now >= nextMicCheck) { micBusy = MicInUse(); nextMicCheck = now + 3; }
+        // Music = sound that keeps going without the gaps speech has, and not while you're on a call.
+        float gaps = gapShare;
+        bool wasOn = musicOn;
+        if (musicOn && (gaps > 0.25f || micBusy)) musicOn = false;
+        if (!musicOn && soundSecs > 1.2 && gaps < 0.1f && !micBusy)
         {
             musicOn = true;
-            if (mode == Mode.Home) Say(Pick("Ooh, I love this song!", "Let's dance!", "Nice beat!", "Turn it up!"));
+            // Only when the music's new, not after every short pause between songs.
+            if (mode == Mode.Home && now - musicOffAt > 30) Say(Pick("Ooh, I love this song!", "Let's dance!", "Nice beat!", "Turn it up!"));
         }
         else if (musicOn && soundSecs < 0.2) musicOn = false;
+        if (wasOn && !musicOn) musicOffAt = now;
 
-        bool dance = musicOn && mode == Mode.Home && !grabbed && sleepW < 0.5f && !PerchedPose && act != Act.Sing;   // asked to sing: it takes the mic instead
-        danceW += ((dance ? 1 : 0) - danceW) * Ease(dance ? 4 : 3, dt);
+        // Off doing its job (pulling a tab, throwing a banana at one): the dancing stops at once, and picks up after.
+        bool onDuty = mode != Mode.Home || act == Act.Throw || blastPhase == 1 || blastPhase == 2;
+        bool dance = musicOn && !onDuty && !grabbed && sleepW < 0.5f && !PerchedPose && act != Act.Sing;   // asked to sing: it takes the mic instead
+        danceW += ((dance ? 1 : 0) - danceW) * Ease(dance ? 4 : onDuty ? 25 : 3, dt);
 
         bool micSing = MicSinging;
         bool canSing = danceW > 0.6f && sleepW < 0.1f && act == Act.None;
@@ -5026,7 +5187,7 @@ public class Monkey : Form
             beatInterval = Math.Max(0.3, Math.Min(0.75, beatInterval * 0.7 + (now - lastBeat) * 0.3));
             lastBeat = now;
             beatCount++;
-            if (danceW > 0.3f)
+            if (danceW > 0.3f && !onDuty)
             {
                 double punch = 0.6 + Math.Min(1, lv * 2);
                 vy -= 220 * punch * danceW;                                      // bounce on the tail
@@ -5149,7 +5310,8 @@ public class Monkey : Form
     {
         bool calm = mode == Mode.Home && !grabbed && sleepW < 0.05f && danceW < 0.05f && perch != Perch.Over && perch != Perch.Down;
         bool singsOn = act == Act.Sing && mode == Mode.Home && !grabbed && sleepW < 0.05f;   // singing carries on through music
-        if (act != Act.None && (ActAge > actLen || !(calm || singsOn))) act = Act.None;
+        bool throwing = act == Act.Throw && mode == Mode.Home && !grabbed;                  // and a banana throw always finishes
+        if (act != Act.None && (ActAge > actLen || !(calm || singsOn || throwing))) act = Act.None;
         actW += ((act == Act.None ? 0 : 1) - actW) * Ease(7, dt);
 
         // Health reminders: when it's home, awake and not busy with something else.
