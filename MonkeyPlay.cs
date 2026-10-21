@@ -136,7 +136,7 @@ public class Monkey : Form
     float lookX, lookY, lag;
 
     // Little habits it does on its own while hanging at home.
-    enum Act { None, Scratch, Look, Pump, Climb, Wave, Eat, Drink, EyeRest, Throw, Shades }
+    enum Act { None, Scratch, Look, Pump, Climb, Wave, Eat, Drink, EyeRest, Throw, Shades, Sing }
     Act act = Act.None, lastAct = Act.None;
     double actStart, actLen, nextAct = 5, waveCooldown;
     // Its own movements (swinging, habits, sitting) run on a clock that goes at 82.5% speed, so it's calm to watch.
@@ -173,6 +173,16 @@ public class Monkey : Form
         Color.FromArgb(255, 255, 120, 170), Color.FromArgb(255, 90, 210, 240),
         Color.FromArgb(255, 255, 210, 70), Color.FromArgb(255, 160, 120, 255) };
     readonly List<Zz> zzz = new List<Zz>();
+
+    // Singing when you ask it to (in the chat): a microphone out of its pocket, held under its chin, the song's
+    // lines in its bubble one by one, then the mic goes back. Times are on its calm clock.
+    const double SgReach = 0.35, SgOut = 0.6, SgUp = 1.1, SgLine = 2.6, SgDownLen = 1.1;
+    static readonly PointF MicHold = new PointF(17, 116), MicHead = new PointF(9, 97);   // its fist, and the mic's ball just below the mouth
+    // Asking the monkey itself to sing ("sing me a song", "can you sing?"), not a question about singing.
+    static readonly Regex SingAsk = new Regex(@"^\s*(?:please\s+|pls\s+)?sing\b|\b(?:you|monkey|please|pls|let'?s)\s+sing\b", RegexOptions.IgnoreCase);
+    List<string> songLines = new List<string>();
+    int songShown;
+    bool MicSinging { get { return act == Act.Sing && ActAge >= SgUp && ActAge < actLen - SgDownLen; } }
 
     // Talking: a speech bubble next to its head (no sound).
     string sayText;
@@ -957,6 +967,9 @@ public class Monkey : Form
     string weatherAt = "";           // "lat,lon" to skip the location lookup ("" = find it)
     volatile Forecast weather;      // the latest forecast, filled in by a background thread
     volatile bool weatherBusy, weatherFailed;
+    object[] skyWait;   // a chat question waiting for the forecast: question, use copied text, file
+    // Whole words only, so "brainstorm" or "train" don't count.
+    static readonly Regex SkyAsk = new Regex(@"\b(?:weather|rain(?:s|y|ing)?|umbrella|forecast|temperature|sunny|snow(?:s|y|ing)?|storms?|stormy|thunder\w*)\b", RegexOptions.IgnoreCase);
     bool weatherAsked, weatherToldOnce;
     double nextWeatherFetch = 2, nextWeatherTalk, weatherAskedAt;
     DateTime rainWarnedFor = DateTime.MinValue, fetchedAt;
@@ -1113,6 +1126,13 @@ public class Monkey : Form
 #if WEATHERDEMO
         mood = (Mood)(1 + (int)(now / 5) % 6);   // test build: every face in turn, 5 seconds each
 #endif
+        if (skyWait != null && !weatherBusy)
+        {
+            var w = skyWait;
+            skyWait = null;
+            asking = false;
+            if (chat != null && !chat.IsDisposed) { chat.SetBusy(false); Ask((string)w[0], (bool)w[1], (string)w[2], true, true); }
+        }
         if (weatherAsked && !weatherBusy)
         {
             weatherAsked = false;
@@ -1125,7 +1145,7 @@ public class Monkey : Form
             FetchWeather();
             nextWeatherFetch = now + 30 * 60;
         }
-        if (weatherFailed && !weatherBusy && !weatherAsked) { weatherFailed = false; nextWeatherFetch = Math.Min(nextWeatherFetch, now + 5 * 60); }
+        if (weatherFailed && !weatherBusy && !weatherAsked) { weatherFailed = false; nextWeatherFetch = Math.Min(nextWeatherFetch, now + 60); }   // try again soon
         if (f == null) return;
 
         bool calm = mode == Mode.Home && !grabbed && sleepW < 0.05f && danceW < 0.05f && act == Act.None && !Resting
@@ -1177,12 +1197,49 @@ public class Monkey : Form
         th.Start();
     }
 
+    // Some home connections lose many first tries at a far-off server (the forecast server is in Germany): one
+    // try often hangs until it times out, while the next answers in half a second. So start a few tries a moment
+    // apart and take whichever answers first.
+    static readonly int[] TryDelays = { 0, 600, 1500, 3000, 5000 };   // ms after the first
     static string Download(string url)
+    {
+        object gate = new object();
+        string result = null;
+        Exception error = null;
+        int left = TryDelays.Length;
+        var done = new ManualResetEvent(false);
+        foreach (int d in TryDelays)
+        {
+            int delay = d;
+            new Thread(() =>
+            {
+                try
+                {
+                    if (delay > 0 && done.WaitOne(delay)) return;   // already answered
+                    string text = DownloadOnce(url);
+                    lock (gate) if (result == null) result = text;
+                    done.Set();
+                }
+                catch (Exception ex) { lock (gate) error = ex; }
+                finally { if (Interlocked.Decrement(ref left) == 0) done.Set(); }
+            }) { IsBackground = true }.Start();
+        }
+        done.WaitOne(16000);
+        lock (gate)
+        {
+            if (result != null) return result;
+            throw error ?? new System.Net.WebException("No answer from " + new Uri(url).Host);
+        }
+    }
+
+    static string DownloadOnce(string url)
     {
         System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)3072;   // TLS 1.2
         var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
-        req.Timeout = req.ReadWriteTimeout = 8000;
+        req.Timeout = req.ReadWriteTimeout = 10000;
         req.UserAgent = "MonkeyPlay";
+        req.KeepAlive = false;                 // each try on a connection of its own...
+        req.ServicePoint.ConnectionLimit = 8;  // ...side by side, not queued behind a stuck one
         using (var resp = req.GetResponse())
         using (var rd = new System.IO.StreamReader(resp.GetResponseStream(), System.Text.Encoding.UTF8))
             return rd.ReadToEnd();
@@ -1278,8 +1335,36 @@ public class Monkey : Form
             + "&current=temperature_2m,weather_code,is_day&hourly=weather_code,precipitation_probability"
             + "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
             + "&timezone=auto&forecast_days=2" + (fahrenheit ? "&temperature_unit=fahrenheit" : "");
-        var d = Json(Download(url));
-        var f = new Forecast { Place = placeName, Fahrenheit = fahrenheit };
+        string json = Download(url);
+        var f = ParseForecast(json, placeName, fahrenheit);
+        try { System.IO.File.WriteAllText(ForecastFile, (fahrenheit ? "F" : "C") + "\n" + placeName.Replace("\n", " ") + "\n" + json); } catch { }
+        return f;
+    }
+
+    // The last forecast, kept so that right after a restart it can tell the weather while it fetches a new one.
+    static readonly string ForecastFile = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"MonkeyPlay\forecast.json");
+
+    void LoadSavedForecast()
+    {
+        try
+        {
+            var fi = new System.IO.FileInfo(ForecastFile);
+            if (!fi.Exists || (DateTime.UtcNow - fi.LastWriteTimeUtc).TotalMinutes > 90) return;   // too old to say "now"
+            bool fahrenheit = !System.Globalization.RegionInfo.CurrentRegion.IsMetric;
+            string[] parts = System.IO.File.ReadAllText(ForecastFile).Split(new[] { '\n' }, 3);
+            if (parts.Length < 3 || parts[0] != (fahrenheit ? "F" : "C")) return;
+            weather = ParseForecast(parts[2], parts[1], fahrenheit);
+            fetchedAt = fi.LastWriteTimeUtc;
+        }
+        catch { }
+    }
+
+    static Forecast ParseForecast(string json, string place, bool fahrenheit)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var d = Json(json);
+        var f = new Forecast { Place = place, Fahrenheit = fahrenheit };
         f.Offset = TimeSpan.FromSeconds(Num(d["utc_offset_seconds"]));
         var cur = (Dictionary<string, object>)d["current"];
         f.Temp = Num(cur["temperature_2m"]);
@@ -1391,7 +1476,10 @@ public class Monkey : Form
     const float HolsterScale = 0.75f, NeckGrip = 22;
     bool ahhSaid;
     static float Phase(double ap, double a, double b) { return Smooth((ap - a) / (b - a)); }
-    static int GulpsDone(double ap) { int n = 0; foreach (double gt in GulpTimes) if (ap > gt + 0.15) n++; return n; }
+    // How many gulps are down (smoothly, 0..3): the water drains and the bottle tips up as each one goes.
+    static float GulpsDone(double ap) { float n = 0; foreach (double gt in GulpTimes) n += Phase(ap, gt - 0.05, gt + 0.4); return n; }
+    // Air glugging up into the bottle during a gulp: 0..1 through it, or -1 between gulps.
+    static float GlugPhase(double ap) { foreach (double gt in GulpTimes) { double d = ap - gt; if (d >= 0 && d < 0.5) return (float)(d / 0.5); } return -1; }
     static float GulpBob(double ap)
     {
         foreach (double gt in GulpTimes) { double d = ap - gt; if (d > 0 && d < 0.35) return 2.5f * (float)Math.Sin(Math.PI * d / 0.35); }
@@ -1850,7 +1938,12 @@ public class Monkey : Form
     HookProc hookProc;
     IntPtr hook;
     volatile bool pullTabs = true;
-    bool swallowUp, hasPending;
+    volatile bool swallowUp;
+    bool hasPending;
+    int swallowAt;   // when the release started being held back (Environment.TickCount)
+
+    // Holds back the release that goes with a click it's taking over.
+    void HoldUp() { swallowUp = true; swallowAt = Environment.TickCount; }
     Point pendingPt;
     double pendingSince;
 
@@ -1885,9 +1978,39 @@ public class Monkey : Form
             catch { try { SetProcessDPIAware(); } catch { } }
             // Your own apps come first: the monkey only uses the CPU they leave over (it needs very little).
             try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+            // Anything that goes wrong is written to errors.log and the monkey carries on, rather than a crash dialog.
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += (s, e) => LogError("main", e.Exception);
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => LogError("fatal", e.ExceptionObject as Exception);
             Application.EnableVisualStyles();
             Application.Run(new Monkey());
         }
+    }
+
+    // %APPDATA%\MonkeyPlay\errors.log: when and where something went wrong, to find "sometimes" problems.
+    // The same error is written at most once a minute, and the file is kept small.
+    static readonly string ErrorLog = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"MonkeyPlay\errors.log");
+    static readonly Dictionary<string, DateTime> errorsSeen = new Dictionary<string, DateTime>();
+
+    internal static void LogError(string where, Exception ex)
+    {
+        try
+        {
+            if (ex == null) return;
+            string key = where + "|" + ex.GetType().Name + "|" + ex.TargetSite;
+            lock (errorsSeen)
+            {
+                DateTime last;
+                if (errorsSeen.TryGetValue(key, out last) && (DateTime.Now - last).TotalSeconds < 60) return;
+                errorsSeen[key] = DateTime.Now;
+                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ErrorLog));
+                var fi = new System.IO.FileInfo(ErrorLog);
+                if (fi.Exists && fi.Length > 256 * 1024) fi.Delete();   // start over rather than grow forever
+                System.IO.File.AppendAllText(ErrorLog, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [" + where + "] " + ex + Environment.NewLine + Environment.NewLine);
+            }
+        }
+        catch { }
     }
 
     protected override CreateParams CreateParams
@@ -1909,6 +2032,7 @@ public class Monkey : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         LoadSettings();
+        LoadSavedForecast();
         // Read the Start menu's apps a few seconds after starting (the shell takes ~3 s to list them), so
         // "open excel" never has to wait.
         ThreadPool.QueueUserWorkItem(_ => { Thread.Sleep(5000); WarmApps(); });
@@ -1926,6 +2050,69 @@ public class Monkey : Form
 #endif
 #if SITDEMO
         nextSit = 1.5;   // test build: go and sit right away
+#endif
+#if SINGDEMO
+        // Test build: sing a little song into the microphone (after sitting, with SITDEMO too).
+        var singDemo = new System.Windows.Forms.Timer { Interval = 3000 };
+        singDemo.Tick += (s, e) => { singDemo.Stop(); songLines = SongLines("Here's a song for you!\nBananas in the morning\nSwinging every night"); DoAction("sing"); };
+        singDemo.Start();
+#endif
+#if FRAMES
+        // Test build: save its own frames (just the monkey's window, on white) to the temp folder, to look at.
+        int shot = 0;
+        var shooter = new System.Windows.Forms.Timer { Interval = 150 };
+        shooter.Tick += (s, e) =>
+        {
+            if (canvas == null || ++shot > 70) { if (shot > 70) shooter.Stop(); return; }
+            using (var copy = new Bitmap(canvas.Bmp.Width, canvas.Bmp.Height))
+            {
+                using (var cg = Graphics.FromImage(copy)) { cg.Clear(Color.White); cg.DrawImage(canvas.Bmp, 0, 0); }
+                copy.Save(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_frame_" + shot.ToString("00") + ".png"));
+            }
+            System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_frame_log.txt"),
+                shot.ToString("00") + " act=" + act + " shown=" + ShownAct + " age=" + ActAge.ToString("F2") + " actW=" + actW.ToString("F2") + " dance=" + danceW.ToString("F2")
+                + " sleep=" + sleepW.ToString("F2") + " mode=" + mode + " perch=" + perch + Environment.NewLine);
+        };
+        shooter.Start();
+#endif
+#if WEATHERTEST
+        // Test build: fetch the forecast the app's way and write what happened to the temp folder.
+        Forecast saved = weather;
+        var askT = new System.Windows.Forms.Timer { Interval = 3000 };
+        askT.Tick += (s, e) => { askT.Stop(); AskWeather(); System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_weather_said.txt"), sayText ?? "(nothing)"); };
+        askT.Start();
+        new Thread(() =>
+        {
+            string log = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "monkey_weather.txt"), outp;
+            var sw = Stopwatch.StartNew();
+            try { var f = LoadForecast(weatherAt, false); outp = "ok in " + sw.ElapsedMilliseconds + " ms: " + f.Summary(); }
+            catch (Exception ex) { outp = "failed after " + sw.ElapsedMilliseconds + " ms: " + ex; }
+            System.IO.File.WriteAllText(log, "saved forecast at start: " + (saved != null ? saved.Summary() : "none") + Environment.NewLine + outp);
+        }) { IsBackground = true }.Start();
+#endif
+#if CHATLOOK
+        // Test build: open the chat with a few messages in it and save a picture of just the chat window.
+        var look = new System.Windows.Forms.Timer { Interval = 1500 };
+        int lookStep = 0;
+        look.Tick += (s, e) =>
+        {
+            lookStep++;
+            if (lookStep == 1) OpenChat();
+            else if (lookStep == 2) { SaveChatLook("monkey_chatlook_welcome.png"); chat.FocusInput(); }
+            else if (lookStep == 3)
+            {
+                chat.AddMessage("You", "what's the weather like today?");
+                chat.AddMessage("Monkey", "It's 33°C and cloudy in Coimbatore, with thunderstorms likely this afternoon (97% chance). Take an umbrella! 🌂");
+                chat.AddMessage("You", "find gst");
+                chat.AddFiles("Found 2 matches for \"gst\". Click one to open it, or type \"open 1\":",
+                    new List<string> { Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), Environment.GetFolderPath(Environment.SpecialFolder.Desktop) });
+                chat.AddNote("Opening Documents...");
+                chat.SetBusy(true);
+            }
+            else if (lookStep == 4) { SaveChatLook("monkey_chatlook.png"); chat.SetBusy(false); }
+            else if (lookStep == 5) { SaveChatLook("monkey_chatlook_idle.png"); look.Stop(); }
+        };
+        look.Start();
 #endif
 #if CHIMEDEMO
         hiddenByUser = false;   // test build: out even if it was put away (not saved)
@@ -1946,7 +2133,7 @@ public class Monkey : Form
 #if CHATTEST
         // Test build: open the chat and ask one question by itself.
         var chatDemo = new System.Windows.Forms.Timer { Interval = 2000 };
-        chatDemo.Tick += (s, e) => { chatDemo.Stop(); OpenChat(); chatAskedAt = clock.Elapsed.TotalSeconds; Ask("Hi Monkey! In one sentence, what can you help me with?", false); };
+        chatDemo.Tick += (s, e) => { chatDemo.Stop(); OpenChat(); chatAskedAt = clock.Elapsed.TotalSeconds; Ask("Hi Monkey! In one sentence, what can you help me with?", false, null); };
         chatDemo.Start();
 #endif
 #if FILETEST
@@ -2208,6 +2395,13 @@ public class Monkey : Form
 
     IntPtr OnMouseHook(int code, IntPtr w, IntPtr l)
     {
+        // Whatever happens in here, your click must never get stuck: on any error it simply goes through.
+        try { return MouseHook(code, w, l); }
+        catch (Exception ex) { LogError("mouse hook", ex); return CallNextHookEx(hook, code, w, l); }
+    }
+
+    IntPtr MouseHook(int code, IntPtr w, IntPtr l)
+    {
         if (code >= 0 && (pullTabs || blastTabs) && !Hidden)
         {
             int msg = (int)w;
@@ -2235,29 +2429,42 @@ public class Monkey : Form
             if (!injected)
             {
                 if (msg == 0x202 /* LBUTTONUP */ && swallowUp) { swallowUp = false; return (IntPtr)1; }
+                if (msg == 0x201) swallowUp = false;   // a new press: the release it was waiting for is long gone
                 RectangleF tab;
                 if (msg == 0x201 && blastTabs && !grabbed && FindCloseButton(info.pt, out tab))
                 {
                     var cp = new Point(info.pt.x, info.pt.y);
+                    // A throw that never finished: give up on it, and this click closes the tab the plain way.
+                    if ((blastPhase == 1 || blastPhase == 2) && clock.Elapsed.TotalSeconds - blastStart > BlastMaxTime)
+                    {
+                        blastPhase = 0;
+                        Point owed = blastClick;   // the stuck throw's own tab still gets closed
+                        BeginInvoke(new Action(() => { AbandonBlast(); ReplayClick(owed); }));   // its window belongs to the main thread
+                        return CallNextHookEx(hook, code, w, l);
+                    }
                     // Clicked the same x again while the banana's on its way: one banana, one tab.
-                    if ((blastPhase == 1 || blastPhase == 2) && tab == blastTab) { swallowUp = true; return (IntPtr)1; }
+                    if ((blastPhase == 1 || blastPhase == 2) && tab == blastTab) { HoldUp(); return (IntPtr)1; }
                     if ((blastPhase == 0 || blastPhase == 3) && mode == Mode.Home)
                     {
-                        swallowUp = true;
-                        BeginInvoke(new Action(() => StartBlast(tab, cp)));
+                        HoldUp();
+                        BeginInvoke(new Action(() =>
+                        {
+                            try { StartBlast(tab, cp); }
+                            catch { AbandonBlast(); ReplayClick(cp); }   // no banana this time, but the tab still closes
+                        }));
                         return (IntPtr)1;
                     }
                     if (!hasQueuedBlast)
                     {
                         // Off at a tab, or a banana's already flying: this one goes as soon as it can.
-                        swallowUp = true;
+                        HoldUp();
                         hasQueuedBlast = true; queuedTab = tab; queuedClick = cp; queuedAt = clock.Elapsed.TotalSeconds;
                         return (IntPtr)1;
                     }
                 }
                 if (msg == 0x201 /* LBUTTONDOWN */ && pullTabs && !grabbed && mode != Mode.PullDown && FindTab(info.pt, out tab))
                 {
-                    swallowUp = true;
+                    HoldUp();
                     var p = new Point(info.pt.x, info.pt.y);
                     BeginInvoke(new Action(() => PullTab(tab, p)));
                     return (IntPtr)1;
@@ -2314,11 +2521,24 @@ public class Monkey : Form
         "You can move your own cartoon body (nothing else) by putting one tag at the very end of your reply: " +
         "[do:shades_off] take off your sunglasses (you push them up onto your head), [do:shades_on] put them back over your eyes, [do:wave] wave, " +
         "[do:banana] eat a banana from your pocket, [do:drink] drink some water, [do:sit] sit on your branch, " +
-        "[do:climb] climb up your tail, [do:look] look around. Use a tag only when the user asks you to do that " +
+        "[do:climb] climb up your tail, [do:look] look around, [do:sing] pull a microphone out of your pocket and sing into it " +
+        "(whenever they ask you to sing: write a short, fun song of four to six short lines, one line each, and use this tag). Use a tag only when the user asks you to do that " +
         "(or it clearly fits), at most one per reply. The user never sees the tag, so also say what you're doing. " +
         "You can't open apps yourself, but when the user wants an app opened (or one clearly helps), put [app:Name] " +
         "at the very end, using the app's usual name (like [app:Excel] or [app:Calculator]): the monkey app shows them " +
         "an Open button and nothing opens unless they click it. They can also type \"open\" and an app's name.";
+
+#if CHATLOOK
+    void SaveChatLook(string name)
+    {
+        var r = chat.Bounds;
+        using (var bmp = new Bitmap(r.Width, r.Height))
+        {
+            using (var g = Graphics.FromImage(bmp)) g.CopyFromScreen(r.Location, Point.Empty, r.Size);
+            bmp.Save(System.IO.Path.Combine(System.IO.Path.GetTempPath(), name));
+        }
+    }
+#endif
 
     void OpenChat()
     {
@@ -2326,6 +2546,11 @@ public class Monkey : Form
         {
             chat = new ChatBox(ScaleAt(Point.Round(home)));
             chat.Send += (text, useClip, file) => Ask(text, useClip, file);
+            // After a quiet spell: wake Claude Code while you type (but if it won't start, don't retry on every key).
+            chat.Typing += () =>
+            {
+                if ((link == null || !link.Running) && clock.Elapsed.TotalSeconds - lastLinkTry > 15) { lastLinkTry = clock.Elapsed.TotalSeconds; EnsureLink(); }
+            };
             chat.NewChat += () =>
             {
                 chatSession = null;
@@ -2356,6 +2581,31 @@ public class Monkey : Form
     double lastChatUse;
     string chatModel = "fast";   // fast (Haiku), balanced (Sonnet) or smart (Opus)
     bool replyStarted;
+    string lastAsked;            // your last question to Claude (so "sing" works even if it forgets the tag)
+
+    // The lines of a song in a reply, for its bubble: no intro line, labels or emoji; at most five.
+    List<string> SongLines(string reply)
+    {
+        var list = new List<string>();
+        string clean = Regex.Replace(reply, @"[*_`#>\[\]]+", "");
+        clean = Regex.Replace(clean, @"[\uD800-\uDFFF\uFE0F\u200D]", "");
+        foreach (string raw in Regex.Split(clean, @"\r?\n|(?<=[.!?])\s+"))
+        {
+            string line = Regex.Replace(raw, @"\s+", " ").Trim().Trim('-', '\u2022', '\u266A', '\u266B', ' ');
+            if (line.Length < 4 || !Regex.IsMatch(line, @"\p{L}")) continue;
+            if (line.Length < 24 && Regex.IsMatch(line, @"^\(?(verse|chorus|bridge|intro|outro)\b", RegexOptions.IgnoreCase)) continue;
+            if (line.Length > 60) line = line.Substring(0, 57).TrimEnd() + "...";
+            list.Add(line);
+        }
+        if (list.Count > 2 && Regex.IsMatch(list[0], @"song|sing|here'?s|for you|ahem|mic", RegexOptions.IgnoreCase)) list.RemoveAt(0);
+        if (list.Count > 5) list.RemoveRange(5, list.Count - 5);
+        if (list.Count == 0) { list.Add(Lyrics[rnd.Next(Lyrics.Length)]); list.Add(Lyrics[rnd.Next(Lyrics.Length)]); }
+        for (int i = 0; i < list.Count; i++)
+            if (list[i].IndexOf('\u266A') < 0 && list[i].IndexOf('\u266B') < 0) list[i] += i % 2 == 0 ? " \u266A" : " \u266B";
+        return list;
+    }
+
+    double lastLinkTry = -100;
 
     void EnsureLink()
     {
@@ -2373,7 +2623,7 @@ public class Monkey : Form
         lastChatUse = clock.Elapsed.TotalSeconds;
     }
 
-    void Ask(string question, bool useClip, string file, bool noCommands = false)
+    void Ask(string question, bool useClip, string file, bool noCommands = false, bool waitedForSky = false)
     {
         if (asking || string.IsNullOrWhiteSpace(question)) return;
         // "find ..." and "open ..." are done here on the PC; they never go to Claude.
@@ -2382,6 +2632,18 @@ public class Monkey : Form
         if (!noCommands && !useClip && file == null && Regex.IsMatch(question.Trim(), @"^(?:please\s+)?(?:(?:check|scan|test|examine)(?:\s+up)?\s+(?:my\s+|the\s+|this\s+)?(?:laptop|pc|computer|system|machine)(?:'?s)?(?:\s+(?:health|condition))?|(?:laptop|pc|computer|system)\s+(?:check-?up|health(?:\s+check)?|condition)|check-?up|health\s*check|how'?s\s+my\s+(?:laptop|pc|computer)(?:\s+doing)?)\s*[?.!]*$", RegexOptions.IgnoreCase))
         { AskCheckup(true, question.Trim()); return; }
         if (!noCommands && !useClip && file == null && FileCommand(question.Trim())) return;
+        if (!waitedForSky && weatherOn && SkyAsk.IsMatch(question) && (weather == null || (DateTime.UtcNow - fetchedAt).TotalHours > 1))
+        {
+            // Asked about the weather before it has a fresh forecast: get one first, then ask Claude with it.
+            chat.AddMessage("You", question.Trim());
+            chat.AddNote("Checking the sky first...");
+            chat.SetBusy(true);
+            asking = true;
+            skyWait = new object[] { question, useClip, file };
+            FetchWeather();
+            Say(Pick("Let me check the sky...", "Sniffing the air..."), true, 6);
+            return;
+        }
         string prompt = question.Trim();
         if (file != null)
         {
@@ -2404,6 +2666,8 @@ public class Monkey : Form
         Forecast wf = weather;
         if (wf != null && Regex.IsMatch(question, @"weather|rain|umbrella|sunny|snow|storm|forecast|temperature|\bhot\b|\bcold\b|tomorrow", RegexOptions.IgnoreCase))
             prompt += "\n\n(Live forecast where I am, from Open-Meteo: " + wf.Summary() + ")";
+        else if (waitedForSky)
+            prompt += "\n\n(The monkey app couldn't reach the weather service just now, so there's no live forecast. Say so kindly and suggest trying again in a minute.)";
         Checkup ck = checkup;
         if (ck != null && (DateTime.Now - ck.At).TotalHours < 6
             && Regex.IsMatch(question, @"\b(slow|lag|hang|laptop|computer|pc|storage|space|disk|ssd|memory|ram|update|virus|antivirus|startup|restart|fast(er)?)\b", RegexOptions.IgnoreCase))
@@ -2419,7 +2683,8 @@ public class Monkey : Form
                     + (br.Maker.Length > 0 ? ", made by " + br.Maker : "") : "") + ")";
         }
         prompt += "\n\n(It's " + DateTime.Now.ToString("dddd d MMMM yyyy, h:mm tt", System.Globalization.CultureInfo.InvariantCulture) + " here.)";
-        chat.AddMessage("You", question.Trim());
+        if (!waitedForSky) chat.AddMessage("You", question.Trim());   // already shown while it checked the sky
+        lastAsked = question.Trim();
         EnsureLink();
         string error;
         if (!link.Ask(prompt, out error)) { chat.AddNote(error); return; }
@@ -3382,7 +3647,7 @@ public class Monkey : Form
         if (chatTurns == 1)
         {
             var again = new System.Windows.Forms.Timer { Interval = 1500 };
-            again.Tick += (s2, e2) => { again.Stop(); firstLogged = false; chatAskedAt = clock.Elapsed.TotalSeconds; Ask("Put your sunglasses back on please!", false); };
+            again.Tick += (s2, e2) => { again.Stop(); firstLogged = false; chatAskedAt = clock.Elapsed.TotalSeconds; Ask("Put your sunglasses back on please!", false, null); };
             again.Start();
         }
 #endif
@@ -3397,6 +3662,8 @@ public class Monkey : Form
             {
                 action = m.Groups[1].Value;
             }
+            if (action == null && lastAsked != null && SingAsk.IsMatch(lastAsked)) action = "sing";   // asked to sing, forgot the tag
+            if (action == "sing") songLines = SongLines(Tags.Replace(reply, ""));
             var am = Regex.Match(reply, @"\[app:([^\]\[\n]{1,40})\]");
             if (am.Success) offerApp = am.Groups[1].Value.Trim();
             reply = Tags.Replace(reply, "").Trim();
@@ -3415,7 +3682,12 @@ public class Monkey : Form
             if (offerApp != null) OfferApp(offerApp);
         }
         if (action != null) DoAction(action);
-        if (ok)
+        if (ok && act == Act.Sing && action == "sing")
+        {
+            grinTime = 1.2;
+            Say(Pick("Mic check, one, two!", "Ahem! This one's for you!", "Hit it! \u266A"), true, 1.2);   // the song follows in the bubble
+        }
+        else if (ok)
         {
             grinTime = 1.2;
             string brief = Regex.Replace(reply, @"[*_`#>]+", "").Trim();
@@ -3460,11 +3732,38 @@ public class Monkey : Form
     }
 
     // Things you can ask the monkey (in the chat) to do with its own body.
+    // Free for something you asked for: the same as UpdateHabits' "calm" (or it would cancel it straight away),
+    // and not in the middle of throwing a banana at a tab.
+    bool ActionFree { get { return FreeFor(false); } }
+
+    // 'evenDancing': singing can take over from dancing.
+    bool FreeFor(bool evenDancing)
+    {
+        return mode == Mode.Home && !grabbed && sleepW < 0.05f && (danceW < 0.05f || evenDancing) && (perch == Perch.None || perch == Perch.Sit)
+            && act != Act.Throw && blastPhase != 1 && blastPhase != 2;
+    }
+    string pendingAction;      // asked for while it was busy, dozing or dancing: done when it can (or dropped)
+    double pendingActionUntil;
+
+    void UpdatePendingAction(double now)
+    {
+        if (pendingAction == null) return;
+        if (now > pendingActionUntil) pendingAction = null;
+        else if (FreeFor(pendingAction == "sing")) DoAction(pendingAction);
+    }
+
     void DoAction(string action)
     {
         double now = clock.Elapsed.TotalSeconds;
+        wakeUntil = Math.Max(wakeUntil, now + StayAwake);   // asked to do something: it wakes up for it
         bool sittingNow = perch == Perch.Sit;
-        bool free = mode == Mode.Home && !grabbed && sleepW < 0.5f && (perch == Perch.None || sittingNow);
+        bool free = FreeFor(action == "sing");
+        pendingAction = null;
+        if (!free && action != "shades_on" && action != "shades_off")
+        {
+            pendingAction = action; pendingActionUntil = now + 4;   // a moment to wake up or finish its throw
+            return;
+        }
         switch (action)
         {
             case "shades_off":
@@ -3492,6 +3791,12 @@ public class Monkey : Form
                 break;
             case "look":
                 if (free) StartAct(Act.Look, 3.0, now);
+                break;
+            case "sing":
+                if (!free) break;
+                if (songLines.Count == 0) songLines = SongLines("");
+                songShown = 0;
+                StartAct(Act.Sing, SgUp + Math.Max(2, songLines.Count) * SgLine + SgDownLen + 0.3, now);
                 break;
         }
     }
@@ -3682,7 +3987,8 @@ public class Monkey : Form
     FxLayer fx = new FxLayer();
     Bitmap fxBmp;
     Rectangle fxArea;
-    const double ThrowWind = 0.2, BoomTime = 1.1;
+    // Reach into the pocket, pull a banana out, wind back, swing forward, and let go near full stretch.
+    const double ThrowGrab = 0.11, ThrowPull = 0.18, ThrowWind = 0.32, ThrowRelease = 0.42, BoomTime = 1.1;
     double flightTime = 0.3;   // set for each throw: farther tabs take a little longer
 
     struct Bit { public PointF p, v; public float a, spin; public RectangleF src; }
@@ -3726,36 +4032,72 @@ public class Monkey : Form
         float ddx = blastAt.X - hx, ddy = blastAt.Y - hy, len = Math.Max(1, (float)Math.Sqrt(ddx * ddx + ddy * ddy));
         throwDir = new PointF(ddx / len, ddy / len);
         handScreen = new PointF(hx, hy);
-        StartAct(Act.Throw, 0.7, now);
+        StartAct(Act.Throw, 0.85, now);
+        actW = 1;   // the arm starts from rest anyway, so it can take the throw at full stretch straight away
         grinTime = 0.9;
         Say(Pick("Bye bye, tab!", "Target locked!", "Fire in the hole!", "This one's mine!"), true);
         blastStart = now;
         blastPhase = 1;
     }
 
+    // A throw takes under a second from click to boom; one still going after this never finished.
+    const double BlastMaxTime = 2.5;
+
+    // Drops the current throw (and its explosion picture), back to ready.
+    void AbandonBlast()
+    {
+        blastPhase = 0;
+        try { fx.Hide(); } catch { }
+        if (tabShot != null) { tabShot.Dispose(); tabShot = null; }
+    }
+
     void UpdateBlast(double now)
     {
-        if (hasQueuedBlast && (blastPhase == 0 || blastPhase == 3))
+        try { StepBlast(now); }
+        catch (Exception ex)
         {
-            if (mode == Mode.Home && !grabbed)
+            // Something went wrong mid-throw: never leave the tab open, or the click swallowed.
+            LogError("blast", ex);
+            bool owed = blastPhase == 1 || blastPhase == 2;
+            AbandonBlast();
+            if (owed) ReplayClick(blastClick);
+        }
+    }
+
+    void StepBlast(double now)
+    {
+        if (hasQueuedBlast)
+        {
+            if ((blastPhase == 0 || blastPhase == 3) && mode == Mode.Home && !grabbed)
             {
                 hasQueuedBlast = false;
                 // Only if that tab is still right there (closing another tab can slide the tabs along).
                 RectangleF still;
-                if (FindCloseButton(new PT { x = queuedClick.X, y = queuedClick.Y }, out still) && still == queuedTab) StartBlast(queuedTab, queuedClick);
+                if (FindCloseButton(new PT { x = queuedClick.X, y = queuedClick.Y }, out still) && still == queuedTab)
+                {
+                    try { StartBlast(queuedTab, queuedClick); }
+                    catch (Exception ex) { LogError("queued blast", ex); AbandonBlast(); ReplayClick(queuedClick); }   // no banana, but it still closes
+                }
                 else Say(Pick("Oops, that tab moved! Click it again?", "It wiggled away! Try again?"), true);
             }
             else if (now - queuedAt > 4)
             {
-                // Taking too long: close it the plain way.
+                // Taking too long (still away, or busy with another throw): close it the plain way.
                 hasQueuedBlast = false;
                 ReplayClick(queuedClick);
             }
         }
         if (blastPhase == 0) return;
-        if (blastPhase == 1 && now - blastStart >= ThrowWind)
+        if ((blastPhase == 1 || blastPhase == 2) && now - blastStart > BlastMaxTime)
         {
-            // Let go of the banana: it flies from the hand to the tab.
+            // The throw never landed: close the tab anyway.
+            AbandonBlast();
+            ReplayClick(blastClick);
+            return;
+        }
+        if (blastPhase == 1 && now - blastStart >= ThrowRelease)
+        {
+            // The arm's swung through: let go of the banana, and it flies from the hand to the tab.
             blastFrom = handScreen;
             Rectangle scr = Screen.FromPoint(Point.Round(blastAt)).Bounds;
             int left = (int)Math.Min(blastFrom.X, blastAt.X) - 170, right = (int)Math.Max(blastFrom.X, blastAt.X) + 170;
@@ -3825,7 +4167,13 @@ public class Monkey : Form
                     pt.Y -= (float)Math.Sin(Math.PI * uu) * Math.Min(140, dist * 0.18f);
                     if (i > 0)
                         using (var b = new SolidBrush(Color.FromArgb(90 - i * 16, 255, 225, 90))) g.FillEllipse(b, pt.X - 7 + i, pt.Y - 7 + i, 14 - 2 * i, 14 - 2 * i);
-                    else DrawBanana(g, new PointF(pt.X, pt.Y + 10), (float)((now - flightStart) * 1100), 1, 0, 1, false);
+                    else
+                    {
+                        // Spinning round its own middle (about 2, -16 from the stem end), right on the path, so it lands on the tab.
+                        float spin = (float)((now - flightStart) * 1100), ra = spin * (float)Math.PI / 180;
+                        float cs = (float)Math.Cos(ra), sn = (float)Math.Sin(ra);
+                        DrawBanana(g, new PointF(pt.X - (2 * cs + 16 * sn), pt.Y - (2 * sn - 16 * cs)), spin, 1, 0, 1, false);
+                    }
                 }
             }
             else
@@ -4275,11 +4623,17 @@ public class Monkey : Form
                 while (PeekMessage(out m, IntPtr.Zero, 0, 0, 1 /* PM_REMOVE */)) if (m.msg == 0x12 /* WM_QUIT */) quit = true;
                 if (quit) break;
                 CheckHoldM();
+                // A release held back for more than a few seconds never came (Windows dropped the hook mid-click):
+                // forget it, or it would stop the hooks ever being put back.
+                if (swallowUp && Environment.TickCount - swallowAt > 3000) swallowUp = false;
                 if (Environment.TickCount - hookedAt > 30000 && !mDown && !mHeld && !swallowUp
                     && GetAsyncKeyState(0x01) >= 0 && GetAsyncKeyState(0x02) >= 0) Hook();   // not mid-click
             }
         });
         t.IsBackground = true;
+        // The rest of the app runs below normal priority so your own apps come first, but Windows only gives this
+        // hook a fraction of a second to answer each click before dropping it: so this one thread runs high.
+        t.Priority = ThreadPriority.Highest;
         t.Start();
 
         var waiter = new Thread(() =>
@@ -4393,7 +4747,7 @@ public class Monkey : Form
                     wait = nextFrameAt - clock.Elapsed.TotalSeconds;
                 }
             double start = clock.Elapsed.TotalSeconds;
-            Frame();
+            try { Frame(); } catch (Exception ex) { LogError("frame", ex); }   // logged; the next frame carries on
             nextFrameAt = start + FrameInterval();
         }
     }
@@ -4468,20 +4822,21 @@ public class Monkey : Form
         motionNow += mdt;
         t += mdt;
         frameDt = dt;
-        UpdateAnchor(now);
-        UpdateSleep(now, dt);
-        UpdateDance(now, dt);
-        UpdateHabits(now, dt);
-        UpdatePerch(now);
-        UpdateBlast(now);
-        CheckChatIdle(now);
-        UpdateShades(now);
-        UpdateWeather(now);
-        UpdateChime(now);
-        UpdateBattery(now);
-        UpdateCheckup(now);
-        UpdateChatCleaning(now);
-        UpdateChat(now, dt);
+        // Each part on its own, so one that goes wrong (and is logged) can't freeze the whole monkey.
+        try { UpdateAnchor(now); } catch (Exception ex) { LogError("anchor", ex); }
+        try { UpdateSleep(now, dt); } catch (Exception ex) { LogError("sleep", ex); }
+        try { UpdateDance(now, dt); } catch (Exception ex) { LogError("dance", ex); }
+        try { UpdateHabits(now, dt); UpdatePendingAction(now); } catch (Exception ex) { LogError("habits", ex); }
+        try { UpdatePerch(now); } catch (Exception ex) { LogError("perch", ex); }
+        UpdateBlast(now);   // looks after its own errors (a tab must still close)
+        try { CheckChatIdle(now); } catch (Exception ex) { LogError("chat idle", ex); }
+        try { UpdateShades(now); } catch (Exception ex) { LogError("shades", ex); }
+        try { UpdateWeather(now); } catch (Exception ex) { LogError("weather", ex); }
+        try { UpdateChime(now); } catch (Exception ex) { LogError("chime", ex); }
+        try { UpdateBattery(now); } catch (Exception ex) { LogError("battery", ex); }
+        try { UpdateCheckup(now); } catch (Exception ex) { LogError("checkup", ex); }
+        try { UpdateChatCleaning(now); } catch (Exception ex) { LogError("chat cleaning", ex); }
+        try { UpdateChat(now, dt); } catch (Exception ex) { LogError("chat", ex); }
 
         double ropeTarget = HandPose ? ArmLen : L, ropeRate = 7;
         if (act == Act.Climb)
@@ -4569,6 +4924,7 @@ public class Monkey : Form
             double lp = ActAge;
             turn += (lp < 1.0 ? -5 : lp < 2.1 ? 5 : 0) * actW;
         }
+        if (ShownAct == Act.Drink) turn *= 1 - actW;   // drinking: face straight ahead, at the bottle
         faceShift += (turn * (1 - sleepW) - faceShift) * Ease(8, dt);
 
         if (peelFlying)
@@ -4644,11 +5000,13 @@ public class Monkey : Form
         }
         else if (musicOn && soundSecs < 0.2) musicOn = false;
 
-        bool dance = musicOn && mode == Mode.Home && !grabbed && sleepW < 0.5f && !PerchedPose;
+        bool dance = musicOn && mode == Mode.Home && !grabbed && sleepW < 0.5f && !PerchedPose && act != Act.Sing;   // asked to sing: it takes the mic instead
         danceW += ((dance ? 1 : 0) - danceW) * Ease(dance ? 4 : 3, dt);
 
+        bool micSing = MicSinging;
         bool canSing = danceW > 0.6f && sleepW < 0.1f && act == Act.None;
-        if (!canSing) { if (singing) singRestUntil = now + 1; singing = false; }
+        if (micSing) singing = true;   // into the microphone: no breaks
+        else if (!canSing) { if (singing) singRestUntil = now + 1; singing = false; }
         else if (singing && now > singUntil) { singing = false; singRestUntil = now + 1.5 + rnd.NextDouble() * 2.5; }
         else if (!singing && now > singRestUntil)
         {
@@ -4656,7 +5014,9 @@ public class Monkey : Form
             singUntil = now + 3 + rnd.NextDouble() * 4;
             if (rnd.Next(3) == 0) Say(Lyrics[rnd.Next(Lyrics.Length)], false, 2.5);   // only when no other line is due
         }
-        singLevel += ((singing ? Math.Min(1, 0.35f + lv * 3) : 0) - singLevel) * Ease(10, dt);
+        singLevel += ((micSing ? 0.8f : singing ? Math.Min(1, 0.35f + lv * 3) : 0) - singLevel) * Ease(10, dt);
+        if (micSing && songShown < songLines.Count && (ActAge - SgUp) / SgLine >= songShown)
+            Say(songLines[songShown++], true, SgLine / CalmSpeed * 0.95);   // the song, a line at a time
 
         // A beat is a sudden jump in loudness; between clear beats it keeps its own groove.
         slowLevel += (lv - slowLevel) * Ease(1.5, dt);
@@ -4698,6 +5058,19 @@ public class Monkey : Form
                     });
                 }
             }
+        }
+        if (beat && micSing && danceW < 0.3f)
+        {
+            // Swaying with the song, a note out of its mouth on every beat.
+            float side = beatCount % 2 == 0 ? 1 : -1;
+            vx += side * 55;
+            Point wp = WindowPos;
+            zzz.Add(new Zz
+            {
+                p = new PointF(wp.X + (headWin.X + side * 34) * S, wp.Y + (headWin.Y + 8) * S), drift = side * (14 + (float)rnd.NextDouble() * 14),
+                note = true, ch = rnd.Next(2) == 0 ? "\u266B" : "\u266A",
+                col = NoteColors[rnd.Next(NoteColors.Length)]
+            });
         }
         beatPhase = Math.Min(1, (now - lastBeat) / beatInterval);
     }
@@ -4775,7 +5148,8 @@ public class Monkey : Form
     void UpdateHabits(double now, double dt)
     {
         bool calm = mode == Mode.Home && !grabbed && sleepW < 0.05f && danceW < 0.05f && perch != Perch.Over && perch != Perch.Down;
-        if (act != Act.None && (ActAge > actLen || !calm)) act = Act.None;
+        bool singsOn = act == Act.Sing && mode == Mode.Home && !grabbed && sleepW < 0.05f;   // singing carries on through music
+        if (act != Act.None && (ActAge > actLen || !(calm || singsOn))) act = Act.None;
         actW += ((act == Act.None ? 0 : 1) - actW) * Ease(7, dt);
 
         // Health reminders: when it's home, awake and not busy with something else.
@@ -5842,7 +6216,8 @@ public class Monkey : Form
 #endif
 
         // A pocket on the hip, with its snack sticking out (until it's taken out to eat).
-        bool bananaTaken = shown == Act.Eat && actW > 0.05f && ActAge >= GrabTime;
+        bool bananaTaken = (shown == Act.Eat && actW > 0.05f && ActAge >= GrabTime)
+                        || (shown == Act.Throw && actW > 0.05f && ActAge >= ThrowGrab);   // or grabbed to throw
         // It snacks all day, so the pocket is stuffed with a bunch; it pulls the middle one out to eat.
         // It never moves, so it's drawn once (at double size, to stay sharp) for each way it can look.
         bool showBananas = perchK < 0.5f;   // sitting, the jacket's upside down, so they're tucked right in
@@ -5886,9 +6261,12 @@ public class Monkey : Form
             tR = Face(new PointF(23, 54 + (float)Math.Sin(t * 22) * 3));                // scratching its head
         if (shown == Act.Throw)
         {
-            // Wind the arm back, then fling it toward the tab and follow through.
+            // Grab a banana from the pocket, wind the arm back, then fling it toward the tab and follow through.
             PointF back = new PointF(46, 98), fling = new PointF(8 + throwDir.X * 58, 60 + throwDir.Y * 58);
-            tR = ap < ThrowWind ? Lerp(restR, back, Smooth(ap / ThrowWind)) : Lerp(back, fling, Smooth((ap - ThrowWind) / 0.12));
+            if (ap < ThrowGrab) tR = Lerp(restR, PocketGrip, Smooth(ap / ThrowGrab));
+            else if (ap < ThrowPull) tR = Lerp(PocketGrip, PocketOut, Smooth((ap - ThrowGrab) / (ThrowPull - ThrowGrab)));
+            else if (ap < ThrowWind) tR = Lerp(PocketOut, back, Smooth((ap - ThrowPull) / (ThrowWind - ThrowPull)));
+            else tR = Lerp(back, fling, Smooth((ap - ThrowWind) / 0.12));
         }
         bool climbing = shown == Act.Climb && ap < ClimbLetGo + 0.4;
         bool gripL = false, gripR = false;
@@ -5931,7 +6309,7 @@ public class Monkey : Form
         if (drinking)
         {
             // The bottle lives in a holder on its jacket (by the hip); the drinking spots are by its face.
-            PointF holdF = Face(DrinkHold), sipF = Face(SipHand);
+            PointF holdF = Face(DrinkHold), sipF = SipHandAt(ap, sitting);
             sipF.Y += GulpBob(ap) * (sitting ? -1 : 1);
             if (ap < DkReach) tR = Lerp(restR, HolsterNeck, Phase(ap, 0, DkReach));
             else if (ap < DkOut) tR = Lerp(HolsterNeck, HolsterOut, Phase(ap, DkReach, DkOut));      // pull it out by the neck
@@ -5955,18 +6333,42 @@ public class Monkey : Form
             float up = Smooth(ap / ShadesLift) * (1 - Smooth((ap - ShadesSwap - 0.15) / 0.35));
             tR = Lerp(restR, Face(new PointF(22, 61)), up);
         }
+        bool micOut = shown == Act.Sing && actW > 0.05f, micShown = false;
+        float micAngle = 180, micStage = 0;
+        if (micOut)
+        {
+            // Out of the pocket (ball first into it, so it comes out handle first), round its head, under the chin.
+            double e = ap - (actLen - SgDownLen);   // putting it away, from 0
+            PointF hold = Face(MicHold);
+            hold.X += (float)Math.Sin(t * 3) * 1.5f;
+            float aim = AngleTo(hold, Face(MicHead)), k;
+            if (ap < SgReach) { tR = Lerp(restR, PocketGrip, Phase(ap, 0, SgReach)); k = 0; }
+            else if (ap < SgOut) { tR = Lerp(PocketGrip, PocketOut, Phase(ap, SgReach, SgOut)); k = 0; }
+            else if (ap < SgUp) { k = Phase(ap, SgOut, SgUp); tR = Curve(PocketOut, Face(AroundHead), hold, k); }
+            else if (e < 0) { tR = hold; k = 1; }
+            else if (e < 0.5) { k = 1 - Phase(e, 0, 0.5); tR = Curve(hold, Face(AroundHead), PocketOut, 1 - k); }
+            else if (e < 0.75) { tR = Lerp(PocketOut, PocketGrip, Phase(e, 0.5, 0.75)); k = 0; }
+            else { tR = Lerp(PocketGrip, restR, Phase(e, 0.75, SgDownLen)); k = 0; }
+            float turn = ((aim - 180) % 360 + 540) % 360 - 180;   // the short way round
+            micAngle = 180 + turn * k;
+            micStage = k;
+            micShown = ap >= SgReach && e < 0.75 && actW > 0.3f;
+            // The other arm out wide, like a star on stage.
+            tL = Lerp(restL, Face(new PointF(-46, 70 + 5 * (float)Math.Sin(t * 2.5))), k);
+        }
         PointF hL = Lerp(restL, tL, actW), hR = Lerp(restR, tR, actW);
+        if (shown == Act.Throw && ap < ThrowRelease + 0.15) hR = tR;                        // the banana's in its hand for the whole swing
         if (shown == Act.Eat && ap >= GrabTime && ap < TossTime && actW > 0.9f) hR = tR;   // the banana stays in its hand
         if (climbing && actW > 0.9f) { hL = tL; hR = tR; }                                  // hands stay on the tail
         if (drinking && actW > 0.9f && ap >= DkReach && ap < DkIn) hR = tR;                // the bottle stays in its hand
+        if (micShown && actW > 0.9f) hR = tR;                                               // and so does the mic
 
         // The other hand twists the cap off, holds it while it drinks, and screws it back on.
         float bottleAngle = 0, bottleScale = HolsterScale, bottleGrip = NeckGrip;
         bool capOn = true;
         if (drinking)
         {
-            float restA = AngleTo(hR, Face(BiteMouth)), sipA = sitting ? AngleTo(Face(SipHand), Face(SipLips)) : SipAngle;
-            sipA += (sitting ? 1 : -1) * 6 * GulpsDone(ap);   // tipped further as it empties
+            float restA = AngleTo(hR, Face(BiteMouth)), sipA = AngleTo(SipHandAt(ap, sitting), Face(SipLips));   // neck to the lips
             if (ap < DkOut) bottleAngle = 0;
             else if (ap < DkFront) bottleAngle = restA * Phase(ap, DkOut, DkFront);
             else if (ap < DkCapOn) bottleAngle = restA + (sipA - restA) * sip;
@@ -6029,7 +6431,7 @@ public class Monkey : Form
         }
 
         ArmTo(g, new PointF(-16, 30), hL, -1);
-        if (eating || drinking)
+        if (eating || drinking || micOut)
             SleevedArm(g, new PointF(16, 30), new PointF(36, 44), new PointF(hR.X + 16, hR.Y - 14), hR);   // arm behind the head
         else if (!scratchInFront)
             ArmTo(g, new PointF(16, 30), hR, 1);
@@ -6045,6 +6447,7 @@ public class Monkey : Form
 #endif
         float headCY = 70 + danceW * 3f * (float)Math.Sin(beatPhase * Math.PI);   // nod to the beat
         if (drinking) headCY += GulpBob(ap);                                        // and bob with each gulp
+        if (micOut) headCY += 2.5f * micStage * (float)Math.Sin(beatPhase * Math.PI);  // nod along to its song
         gulping = drinking && ap >= DkLift - 0.05 && ap < DkLower;
         var headState = g.Save();
         if (perchK > 0)
@@ -6061,8 +6464,20 @@ public class Monkey : Form
 #endif
         if (scratchInFront) ArmTo(g, new PointF(16, 30), hR, 1);
 
-        if (shown == Act.Throw && ap < ThrowWind && actW > 0.3f)   // the banana it's about to throw
-            DrawBanana(g, hR, (float)(Math.Atan2(throwDir.X, -throwDir.Y) * 180 / Math.PI), 1, 0, 1);
+        if (shown == Act.Throw && ap < ThrowGrab && actW > 0.3f) HandShape(g, hR.X, hR.Y + 3, 13);   // reaching for the pocket
+        else if (shown == Act.Throw && ap < ThrowRelease && actW > 0.3f)
+        {
+            // The banana it's about to throw: pulled out tip down, swung back over its shoulder as it winds up,
+            // then whipped round as it swings.
+            float aim = (float)(Math.Atan2(throwDir.X, -throwDir.Y) * 180 / Math.PI), side = throwDir.X >= 0 ? 1 : -1;
+            float cocked = aim - side * 75, k = Smooth((ap - ThrowPull) / (ThrowWind - ThrowPull));
+            float turn = ((cocked - 180) % 360 + 540) % 360 - 180;   // the short way round
+            float angle = ap < ThrowWind ? 180 + turn * k : aim - side * 75 * (1 - Smooth((ap - ThrowWind) / (ThrowRelease - ThrowWind)));
+            var clip = g.Clip;
+            if (ap < ThrowPull) g.SetClip(PocketRect, CombineMode.Exclude);   // the part still in the pocket
+            DrawBanana(g, hR, angle, PocketScale + (1 - PocketScale) * k, 0, 1);
+            g.Clip = clip;
+        }
         if (eating)
         {
             if (ap < TossTime)
@@ -6108,26 +6523,99 @@ public class Monkey : Form
         {
             if (ap >= DkReach && ap < DkIn && actW > 0.3f)
             {
-                float left = 1 - 0.22f * GulpsDone(ap);
+                float left = 1 - 0.24f * GulpsDone(ap);
                 var clip = g.Clip;
                 if (ap < DkOut || ap >= DkBack) g.SetClip(HolsterRect, CombineMode.Exclude);   // the part still in the holder
-                DrawBottle(g, hR, bottleAngle, bottleScale, left, bottleGrip, capOn, true);
+                DrawBottle(g, hR, bottleAngle, bottleScale, left, bottleGrip, capOn, true, sip > 0.9f ? GlugPhase(ap) : -1);
                 g.Clip = clip;
                 if (!capOn) DrawCap(g, hL, bottleAngle);   // the cap, in its other hand
+            }
+            else HandShape(g, hR.X, hR.Y + 3, 13);
+            double dd = ap - DkLower;
+            if (dd > 0 && dd < 1.0 && actW > 0.5f)
+            {
+                // A last drop runs from the corner of its mouth, then falls.
+                float run = 4 * Smooth(dd / 0.45) + (dd > 0.45 ? 48 * (float)Math.Pow((dd - 0.45) / 0.55, 2) : 0);
+                PointF dp = Face(new PointF(5.5f, 88 + run));
+                int al = (int)(230 * Math.Min(1, (1.0 - dd) / 0.25));
+                float sy = sitting ? -1 : 1;   // the drop's tail points back up toward the mouth
+                using (var path = new GraphicsPath())
+                {
+                    path.AddBezier(dp.X, dp.Y - 3.4f * sy, dp.X + 1.2f, dp.Y - 1.4f * sy, dp.X + 2.1f, dp.Y, dp.X + 2.1f, dp.Y + 0.8f * sy);
+                    path.AddBezier(dp.X + 2.1f, dp.Y + 0.8f * sy, dp.X + 2.1f, dp.Y + 2.6f * sy, dp.X - 2.1f, dp.Y + 2.6f * sy, dp.X - 2.1f, dp.Y + 0.8f * sy);
+                    path.AddBezier(dp.X - 2.1f, dp.Y + 0.8f * sy, dp.X - 2.1f, dp.Y, dp.X - 1.2f, dp.Y - 1.4f * sy, dp.X, dp.Y - 3.4f * sy);
+                    using (var b = new SolidBrush(Color.FromArgb(al, 120, 195, 250))) g.FillPath(b, path);
+                    using (var o = new Pen(Color.FromArgb(al, 40, 110, 190), 0.9f)) g.DrawPath(o, path);
+                }
+                using (var b = new SolidBrush(Color.FromArgb(al, 255, 255, 255))) g.FillEllipse(b, dp.X - 1.2f, dp.Y - 0.2f * sy - 0.6f, 1.1f, 1.2f);
+            }
+        }
+        if (micOut)
+        {
+            if (micShown)
+            {
+                var clip = g.Clip;
+                if (micStage < 0.01f) g.SetClip(PocketRect, CombineMode.Exclude);   // the part still in the pocket
+                DrawMic(g, hR, micAngle);
+                g.Clip = clip;
             }
             else HandShape(g, hR.X, hR.Y + 3, 13);
         }
     }
 
+    // A handheld microphone in a fist at 'hand', turned 'angle' degrees from upright (ball at the top).
+    static void DrawMic(Graphics g, PointF hand, float angle)
+    {
+        var st = g.Save();
+        g.TranslateTransform(hand.X, hand.Y);
+        g.RotateTransform(angle);
+        FistBack(g);
+        using (var handle = new GraphicsPath())
+        {
+            handle.AddPolygon(new[] { new PointF(-3.2f, -13), new PointF(3.2f, -13), new PointF(2.2f, 10), new PointF(-2.2f, 10) });
+            using (var b = new LinearGradientBrush(new RectangleF(-3.5f, -13, 7, 23), Color.FromArgb(255, 70, 70, 82), Color.FromArgb(255, 25, 25, 32), LinearGradientMode.Horizontal))
+                g.FillPath(b, handle);
+            using (var o = new Pen(Outline, 1.1f) { LineJoin = LineJoin.Round }) g.DrawPath(o, handle);
+        }
+        using (var b = new SolidBrush(Color.FromArgb(255, 200, 205, 215))) g.FillRectangle(b, -4.2f, -15.5f, 8.4f, 3.5f);   // the collar
+        using (var o = new Pen(Outline, 1f)) g.DrawRectangle(o, -4.2f, -15.5f, 8.4f, 3.5f);
+        var ball = new RectangleF(-6.8f, -28.5f, 13.6f, 13.6f);
+        using (var b = new LinearGradientBrush(ball, Color.FromArgb(255, 240, 242, 248), Color.FromArgb(255, 140, 145, 158), 45f)) g.FillEllipse(b, ball);
+        using (var round = new GraphicsPath())
+        {
+            round.AddEllipse(ball);
+            var clip = g.Clip;
+            g.SetClip(round, CombineMode.Intersect);
+            using (var mesh = new Pen(Color.FromArgb(150, 90, 95, 108), 0.7f))
+                for (float m = -6; m <= 6; m += 2.4f)
+                {
+                    g.DrawLine(mesh, m, ball.Top, m, ball.Bottom);
+                    g.DrawLine(mesh, ball.Left, -21.7f + m, ball.Right, -21.7f + m);
+                }
+            g.Clip = clip;
+        }
+        using (var shine = new SolidBrush(Color.FromArgb(170, 255, 255, 255))) g.FillEllipse(shine, -4.5f, -26.5f, 4, 3);
+        using (var o = new Pen(Outline, 1.2f)) g.DrawEllipse(o, ball);
+        FistFront(g);
+        g.Restore(st);
+    }
+
     // Drinking pose: the bottle lies almost level with its bottom tipped up a little, the cap's top
     // at the lips (just right of the mouth's middle, head drawn at 0, 70), the hand beside the jaw.
-    static readonly PointF SipLips = new PointF(2, 84), SipDir = new PointF(0.994f, -0.11f);   // lips -> bottom
-    static readonly PointF SipHand = new PointF(SipLips.X + SipDir.X * 31, SipLips.Y + SipDir.Y * 31);
-    static readonly float SipAngle = (float)(Math.Atan2(-SipDir.X, SipDir.Y) * 180 / Math.PI);
+    // The bottle's open neck rests in the middle of its "ooh" mouth; the bottom starts tipped up a little and
+    // goes higher with each gulp, the way you tip a bottle further as it empties.
+    static readonly PointF SipLips = new PointF(0.5f, 84);
+    const float SipNeck = 26;   // from its fist to the open neck (cap off)
+    PointF SipHandAt(double ap, bool sitting)
+    {
+        double tilt = (20 + 10 * GulpsDone(ap)) * Math.PI / 180;   // the bottom, above level
+        PointF lips = Face(SipLips);
+        return new PointF(lips.X + SipNeck * (float)Math.Cos(tilt), lips.Y + SipNeck * (float)Math.Sin(tilt) * (sitting ? 1 : -1));
+    }
 
     // A small water bottle held in a fist at 'hand', turned 'angle' degrees from upright.
     // 'grip' slides the bottle so the fist holds it higher up (22 = by the neck); without 'held', no hand at all.
-    void DrawBottle(Graphics g, PointF hand, float angle, float appear, float waterLeft, float grip = 0, bool capOn = true, bool held = true)
+    void DrawBottle(Graphics g, PointF hand, float angle, float appear, float waterLeft, float grip = 0, bool capOn = true, bool held = true, float glug = -1)
     {
         if (appear < 0.02f) { if (held) HandShape(g, hand.X, hand.Y + 3, 13); return; }   // bottle put away: open hand
         var st = g.Save();
@@ -6150,6 +6638,16 @@ public class Monkey : Form
             float top = tipped ? -28 : 4 - 30 * waterLeft, depth = tipped ? 30 * waterLeft : 34;
             using (var water = new LinearGradientBrush(new RectangleF(-6, top - 1, 12, 36), Color.FromArgb(220, 90, 175, 245), Color.FromArgb(230, 40, 120, 220), LinearGradientMode.Vertical))
                 g.FillRectangle(water, -6, top, 12, depth);
+            if (glug >= 0 && tipped)
+                // Air glugging in at the neck and wobbling up to the bottom (which is the top now).
+                for (int i = 0; i < 4; i++)
+                {
+                    float u = glug * 1.5f - i * 0.17f;
+                    if (u <= 0 || u >= 1) continue;
+                    float by = -24 + 26 * u, bx = (float)Math.Sin(u * 10 + i * 2) * 1.8f, br = 1.1f + 0.35f * (i % 3);
+                    using (var bb = new SolidBrush(Color.FromArgb(150, 235, 248, 255))) g.FillEllipse(bb, bx - br, by - br, 2 * br, 2 * br);
+                    using (var bo = new Pen(Color.FromArgb(200, 255, 255, 255), 0.6f)) g.DrawEllipse(bo, bx - br, by - br, 2 * br, 2 * br);
+                }
             using (var shine = new SolidBrush(Color.FromArgb(150, 255, 255, 255))) g.FillRectangle(shine, -3.5f, -21, 1.6f, 18);
             using (var label = new SolidBrush(Color.FromArgb(230, 255, 255, 255))) g.FillRectangle(label, -6, -13, 12, 4);
             g.Clip = clip;
@@ -6792,6 +7290,9 @@ public class Monkey : Form
 
         public readonly Graphics G;
         readonly Bitmap bmp;
+#if FRAMES
+        public Bitmap Bmp { get { return bmp; } }
+#endif
         readonly IntPtr dc, dib;
         readonly int w, h;
 
@@ -6872,7 +7373,7 @@ sealed class ClaudeLink
             string model = brain == "smart" ? "opus" : brain == "balanced" ? "sonnet" : "haiku";
             string args = "-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages"
                 + " --tools \"\" --restricted --strict-mcp-config --model " + model + (brain == "smart" ? "" : " --effort low")
-                + " --append-system-prompt-file \"" + personaFile + "\"";
+                + " --system-prompt-file \"" + personaFile + "\"";   // just the persona: Claude Code's own long coding prompt made every answer slower
             if (resumeSession != null && Regex.IsMatch(resumeSession, "^[0-9a-fA-F-]{8,64}$")) args += " --resume " + resumeSession;
             bool isCmd = exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase);
             var psi = new ProcessStartInfo(isCmd ? "cmd.exe" : exe, isCmd ? "/d /s /c \"\"" + exe + "\" " + args + "\"" : args)
@@ -6881,6 +7382,7 @@ sealed class ClaudeLink
                 RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
                 StandardOutputEncoding = System.Text.Encoding.UTF8, StandardErrorEncoding = System.Text.Encoding.UTF8
             };
+            psi.EnvironmentVariables["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1";   // no update checks or telemetry on start: up sooner
             // The monkey runs at low priority, which Claude Code would inherit; replies should come at full speed.
             var me = Process.GetCurrentProcess();
             try { me.PriorityClass = ProcessPriorityClass.Normal; } catch { }
@@ -6984,36 +7486,87 @@ class ChatBox : Form
 {
     public event Action<string, bool, string> Send;    // your message, use copied text, attached file (or null)
     public event Action NewChat;
+    public event Action Typing;                        // you started writing a message
     readonly RichTextBox history = new RichTextBox();
-    readonly TextBox input = new TextBox();
-    readonly CheckBox useClip = new CheckBox();
-    readonly Button send = new Button(), fresh = new Button(), attach = new Button();
-    readonly Label status = new Label();
+    readonly CueTextBox input = new CueTextBox();
+    readonly PillButton send = new PillButton(), fresh = new PillButton(), attach = new PillButton(), useClip = new PillButton(),
+                        close = new PillButton(), chip = new PillButton();
+    readonly Label subtitle = new Label();
+    readonly RoundPanel composer = new RoundPanel();
     string attached;     // the one file to send with the next message (you pick it)
-    bool busy;
+    bool busy, hasYou;
 
     // Found files, shown as links in the history: click the name to open it, "folder" to see it in Explorer.
     sealed class FileLink { public int start, end; public string path; public bool folder; public Monkey.App app; }
     readonly List<FileLink> links = new List<FileLink>();
     static readonly Color LinkBlue = Color.FromArgb(20, 90, 200);
     static readonly Color Teal = Color.FromArgb(38, 104, 106), Brown = Color.FromArgb(112, 64, 32);
+    static readonly Color Ink = Color.FromArgb(32, 33, 36), Muted = Color.FromArgb(120, 126, 132);
+    static readonly Color Chrome = Color.FromArgb(243, 244, 246), Line = Color.FromArgb(222, 224, 228);
+    readonly Font nameFont = new Font("Segoe UI Semibold", 10f), timeFont = new Font("Segoe UI", 8f),
+                  noteFont = new Font("Segoe UI", 9f, FontStyle.Italic), spacer = new Font("Segoe UI", 5f);
+    const int Edge = 6;   // the frame you can grab to resize it
+
+    [DllImport("user32.dll")] static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", EntryPoint = "SendMessage")] static extern IntPtr SendParaFormat(IntPtr h, int msg, IntPtr w, ref PARAFORMAT2 pf);
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PARAFORMAT2
+    {
+        public int cbSize; public uint dwMask; public short wNumbering, wReserved; public int dxStartIndent, dxRightIndent, dxOffset;
+        public short wAlignment, cTabCount; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public int[] rgxTabs;
+        public int dySpaceBefore, dySpaceAfter, dyLineSpacing; public short sStyle; public byte bLineSpacingRule, bOutlineLevel;
+        public short wShadingWeight, wShadingStyle, wNumberingStart, wNumberingStyle, wNumberingTab, wBorderSpace, wBorderWidth, wBorders;
+    }
 
     public ChatBox(float k)   // k: the screen's scale (1.25 at 125%); the text grows with it, so the boxes must too
     {
-        Text = "Ask Monkey \U0001F412";
-        FormBorderStyle = FormBorderStyle.SizableToolWindow;
+        Text = "Ask Monkey";
+        FormBorderStyle = FormBorderStyle.None;   // its own header instead of the Windows title bar
         StartPosition = FormStartPosition.Manual;
         TopMost = true;
         ShowInTaskbar = false;
-        Size = new Size((int)(420 * k), (int)(520 * k));
-        MinimumSize = new Size((int)(380 * k), (int)(300 * k));
+        KeyPreview = true;
+        Size = new Size((int)(430 * k), (int)(580 * k));
+        MinimumSize = new Size((int)(360 * k), (int)(360 * k));
         Font = new Font("Segoe UI", 9.5f);
-        BackColor = Color.FromArgb(250, 247, 240);
+        BackColor = Chrome;
+        Padding = new Padding(Edge);
+        DoubleBuffered = true;
 
+        // ---- Header: who it is, what it's doing, New chat and close ----
+        var header = new Panel { Dock = DockStyle.Top, Height = (int)(54 * k), BackColor = Chrome };
+        var avatar = new Panel { Size = new Size((int)(36 * k), (int)(36 * k)), Location = new Point((int)(6 * k), (int)(9 * k)), BackColor = Chrome };
+        avatar.Paint += (s, e) => DrawAvatar(e.Graphics, avatar.ClientSize);
+        var title = new Label { Text = "Monkey", Font = new Font("Segoe UI Semibold", 11.5f), ForeColor = Ink, AutoSize = true,
+            Location = new Point((int)(50 * k), (int)(8 * k)), BackColor = Chrome };
+        subtitle.Font = new Font("Segoe UI", 8.5f); subtitle.ForeColor = Muted; subtitle.AutoSize = true; subtitle.BackColor = Chrome;
+        subtitle.Location = new Point((int)(51 * k), (int)(29 * k));
+        close.Text = "✕"; close.Font = new Font("Segoe UI Symbol", 10f); close.Size = new Size((int)(32 * k), (int)(32 * k));
+        close.Fore = Muted; close.Hover = Color.FromArgb(228, 230, 234);
+        close.Click += (s, e) => Hide();
+        fresh.Text = "+  New chat"; fresh.Font = new Font("Segoe UI Semibold", 9f); fresh.Size = new Size((int)(96 * k), (int)(30 * k));
+        fresh.Fore = Teal; fresh.Border = Line; fresh.Back = Color.White; fresh.Hover = Color.FromArgb(232, 242, 242); fresh.Radius = 15 * k;
+        fresh.Click += (s, e) => { history.Clear(); links.Clear(); hasYou = false; Spacing(); Welcome(); if (NewChat != null) NewChat(); FocusInput(); };
+        header.Resize += (s, e) =>
+        {
+            close.Location = new Point(header.Width - close.Width, (int)(11 * k));
+            fresh.Location = new Point(close.Left - fresh.Width - (int)(6 * k), (int)(12 * k));
+        };
+        header.Controls.AddRange(new Control[] { avatar, title, subtitle, fresh, close });
+        foreach (Control c in new Control[] { header, avatar, title, subtitle }) c.MouseDown += DragWindow;   // move it by its header
+
+        // ---- The conversation, on a white card ----
+        var card = new RoundPanel { Dock = DockStyle.Fill, Fill = Color.White, Border = Line, Radius = 10 * k,
+            Padding = new Padding((int)(14 * k), (int)(10 * k), (int)(4 * k), (int)(8 * k)), BackColor = Chrome };
         history.ReadOnly = true;
         history.BorderStyle = BorderStyle.None;
         history.BackColor = Color.White;
+        history.ForeColor = Ink;
         history.Dock = DockStyle.Fill;
+        history.ScrollBars = RichTextBoxScrollBars.Vertical;
         history.Font = new Font("Segoe UI Emoji", 10f);   // like Segoe UI, but emoji show up instead of empty boxes
         history.DetectUrls = true;
         history.LinkClicked += (s, e) => { try { Process.Start(e.LinkText); } catch { } };
@@ -7025,49 +7578,203 @@ class ChatBox : Form
             if (l != null && l.app != null) { Monkey.OpenApp(l.app); AddNote("Opening " + l.app.Name + "..."); }
             else if (l != null) Monkey.OpenFile(l.path, l.folder);
         };
+        card.Controls.Add(history);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = (int)(118 * k), Padding = new Padding((int)(8 * k), (int)(6 * k), (int)(8 * k), (int)(8 * k)) };
+        // ---- Writing a message: the box, its buttons, and a hint below ----
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = (int)(150 * k), BackColor = Chrome, Padding = new Padding(0, (int)(8 * k), 0, 0) };
+        chip.Dock = DockStyle.Top; chip.Height = (int)(28 * k); chip.Visible = false;
+        chip.Font = new Font("Segoe UI Emoji", 8.5f); chip.Fore = Ink; chip.Back = Color.FromArgb(226, 238, 238); chip.Hover = Color.FromArgb(214, 230, 230);
+        chip.Radius = 14 * k; chip.AlignLeft = true;
+        chip.Click += (s, e) => { if (!busy && attached != null) { attached = null; ShowStatus(); } };   // click to take it off again
+        var chipGap = new Panel { Dock = DockStyle.Top, Height = (int)(6 * k), BackColor = Chrome };
+        var hint = new Label { Dock = DockStyle.Bottom, Height = (int)(22 * k), Text = "Enter to send  ·  Shift+Enter for a new line",
+            ForeColor = Muted, Font = new Font("Segoe UI", 8f), TextAlign = ContentAlignment.MiddleCenter, BackColor = Chrome };
+
+        composer.Dock = DockStyle.Fill; composer.Fill = Color.White; composer.Border = Line; composer.Radius = 12 * k; composer.BackColor = Chrome;
+        composer.Padding = new Padding((int)(12 * k), (int)(9 * k), (int)(8 * k), (int)(6 * k));
         input.Multiline = true;
         input.Dock = DockStyle.Fill;
-        input.ScrollBars = ScrollBars.Vertical;
+        input.BorderStyle = BorderStyle.None;
+        input.BackColor = Color.White;
+        input.ForeColor = Ink;
+        input.Font = new Font("Segoe UI", 10f);
+        input.Cue = "Message Monkey…";
         input.KeyDown += (s, e) =>
         {
             if (e.KeyCode == Keys.Enter && !e.Shift) { e.SuppressKeyPress = true; DoSend(); }   // Shift+Enter: new line
         };
-        var row = new Panel { Dock = DockStyle.Bottom, Height = (int)(34 * k) };
-        useClip.Text = "Use copied text";
-        useClip.AutoSize = true;
-        useClip.Location = new Point(0, (int)(8 * k));
-        attach.Text = "File...";
-        attach.Size = new Size((int)(60 * k), (int)(28 * k));
-        attach.FlatStyle = FlatStyle.Flat;
-        attach.Click += (s, e) => PickFile();
-        status.Click += (s, e) => { if (!busy && attached != null) { attached = null; ShowStatus(); } };   // click to take it off again
-        send.Text = "Send";
-        send.Size = new Size((int)(70 * k), (int)(28 * k));
-        send.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        send.BackColor = Teal; send.ForeColor = Color.White; send.FlatStyle = FlatStyle.Flat;
-        send.Click += (s, e) => DoSend();
-        fresh.Text = "New chat";
-        fresh.Size = new Size((int)(84 * k), (int)(28 * k));
-        fresh.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        fresh.FlatStyle = FlatStyle.Flat;
-        fresh.Click += (s, e) => { history.Clear(); links.Clear(); if (NewChat != null) NewChat(); FocusInput(); };
-        row.Controls.Add(useClip); row.Controls.Add(attach); row.Controls.Add(fresh); row.Controls.Add(send);
-        row.Resize += (s, e) =>
-        {
-            send.Location = new Point(row.Width - send.Width, (int)(3 * k));
-            fresh.Location = new Point(send.Left - fresh.Width - (int)(6 * k), (int)(3 * k));
-            attach.Location = new Point(fresh.Left - attach.Width - (int)(6 * k), (int)(3 * k));
-        };
-        status.Dock = DockStyle.Top; status.Height = (int)(20 * k); status.ForeColor = Color.Gray;
-        bottom.Controls.Add(input); bottom.Controls.Add(status); bottom.Controls.Add(row);
+        input.TextChanged += (s, e) => { if (input.TextLength > 0 && Typing != null) Typing(); };
+        input.GotFocus += (s, e) => { composer.Border = Teal; composer.Invalidate(); };
+        input.LostFocus += (s, e) => { composer.Border = Line; composer.Invalidate(); };
 
-        Controls.Add(history);
+        var tools = new Panel { Dock = DockStyle.Bottom, Height = (int)(34 * k), BackColor = Color.White };
+        attach.Text = "\U0001F4CE Attach"; attach.Font = new Font("Segoe UI Emoji", 8.5f); attach.Size = new Size((int)(78 * k), (int)(28 * k));
+        attach.Fore = Muted; attach.Hover = Color.FromArgb(240, 241, 243); attach.Radius = 14 * k;
+        attach.Click += (s, e) => PickFile();
+        useClip.Text = "\U0001F4CB Copied text"; useClip.Font = new Font("Segoe UI Emoji", 8.5f); useClip.Size = new Size((int)(108 * k), (int)(28 * k));
+        useClip.Fore = Muted; useClip.Hover = Color.FromArgb(240, 241, 243); useClip.Radius = 14 * k;
+        useClip.Toggle = true; useClip.OnBack = Color.FromArgb(226, 238, 238); useClip.OnFore = Teal;
+        send.Text = "➤"; send.Font = new Font("Segoe UI Symbol", 11f); send.Size = new Size((int)(32 * k), (int)(32 * k));
+        send.Round = true; send.Back = Teal; send.Hover = Color.FromArgb(28, 84, 86); send.Fore = Color.White;
+        send.Click += (s, e) => DoSend();
+        tools.Resize += (s, e) =>
+        {
+            attach.Location = new Point(-(int)(4 * k), (int)(3 * k));
+            useClip.Location = new Point(attach.Right + (int)(2 * k), (int)(3 * k));
+            send.Location = new Point(tools.Width - send.Width, tools.Height - send.Height);
+        };
+        tools.Controls.AddRange(new Control[] { attach, useClip, send });
+        composer.Controls.Add(input);
+        composer.Controls.Add(tools);
+        bottom.Controls.Add(composer);
+        bottom.Controls.Add(chipGap);
+        bottom.Controls.Add(chip);
+        bottom.Controls.Add(hint);
+
+        var gap = new Panel { Dock = DockStyle.Top, Height = (int)(2 * k), BackColor = Chrome };
+        Controls.Add(card);
+        Controls.Add(gap);
+        Controls.Add(header);
         Controls.Add(bottom);
-        AddNote("Hi! I'm Monkey. Ask me anything; I only see what you type here (plus your copied text or one file, when you add them).\n"
-            + "To find a file, type \"find\" and its name (like: find GST invoice). To open an app or folder, type \"open excel\" or \"open downloads\". Type \"battery\" for a battery check-up, or \"check my laptop\" for a full check-up. I do that right here on your PC, "
-            + "and none of it is sent anywhere.");
+
+        Spacing();
+        ShowStatus();
+        Welcome();
+    }
+
+    // ---- Its own window frame: drag by the header, resize from the edges, rounded with a shadow ----
+
+    protected override CreateParams CreateParams
+    {
+        get { var cp = base.CreateParams; cp.ClassStyle |= 0x20000; return cp; }   // CS_DROPSHADOW
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        int round = 2;   // DWMWCP_ROUND (Windows 11; ignored before)
+        try { DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
+    }
+
+    void DragWindow(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        ReleaseCapture();
+        SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg != 0x84 /* WM_NCHITTEST */ || (int)m.Result != 1 /* HTCLIENT */) return;
+        Point p = PointToClient(new Point((short)((long)m.LParam & 0xFFFF), (short)(((long)m.LParam >> 16) & 0xFFFF)));
+        bool l = p.X < Edge * 2, r = p.X >= Width - Edge * 2, t = p.Y < Edge, b = p.Y >= Height - Edge * 2;
+        if (t && l) m.Result = (IntPtr)13; else if (t && r) m.Result = (IntPtr)14;
+        else if (b && l) m.Result = (IntPtr)16; else if (b && r) m.Result = (IntPtr)17;
+        else if (l) m.Result = (IntPtr)10; else if (r) m.Result = (IntPtr)11;
+        else if (t) m.Result = (IntPtr)12; else if (b) m.Result = (IntPtr)15;
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Escape) { e.Handled = true; Hide(); return; }   // like the close button: the chat is kept
+        base.OnKeyDown(e);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        using (var p = new Pen(Line)) e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);   // a hairline edge
+    }
+
+    // A little monkey face in a teal circle.
+    static void DrawAvatar(Graphics g, Size size)
+    {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        float s = Math.Min(size.Width, size.Height) - 1, u = s / 36f;
+        using (var b = new SolidBrush(Teal)) g.FillEllipse(b, 0, 0, s, s);
+        Color fur = Color.FromArgb(120, 72, 38), skin = Color.FromArgb(245, 214, 170);
+        using (var b = new SolidBrush(fur))
+        {
+            g.FillEllipse(b, 5 * u, 12 * u, 8 * u, 8 * u);
+            g.FillEllipse(b, 23 * u, 12 * u, 8 * u, 8 * u);
+            g.FillEllipse(b, 9 * u, 7 * u, 18 * u, 20 * u);
+        }
+        using (var b = new SolidBrush(skin))
+        {
+            g.FillEllipse(b, 7 * u, 14 * u, 3.5f * u, 3.5f * u);
+            g.FillEllipse(b, 26 * u, 14 * u, 3.5f * u, 3.5f * u);
+            g.FillEllipse(b, 11.5f * u, 13 * u, 13 * u, 12 * u);
+        }
+        using (var b = new SolidBrush(Color.FromArgb(40, 30, 25)))
+        {
+            g.FillEllipse(b, 14.2f * u, 15.5f * u, 2.6f * u, 2.8f * u);
+            g.FillEllipse(b, 19.2f * u, 15.5f * u, 2.6f * u, 2.8f * u);
+        }
+        using (var p = new Pen(Color.FromArgb(90, 50, 30), 1.2f * u) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            g.DrawArc(p, 15 * u, 18.5f * u, 6 * u, 3.5f * u, 20, 140);
+    }
+
+    // A bit more room between lines and paragraphs than a plain text box gives.
+    void Spacing()
+    {
+        try
+        {
+            var pf = new PARAFORMAT2 { cbSize = Marshal.SizeOf(typeof(PARAFORMAT2)), dwMask = 0x00000100 | 0x00000080 /* LINESPACING | SPACEAFTER */,
+                bLineSpacingRule = 5, dyLineSpacing = 23 /* 1.15 lines, in twentieths */, dySpaceAfter = 20, rgxTabs = new int[32] };
+            history.SelectAll();
+            SendParaFormat(history.Handle, 0x447 /* EM_SETPARAFORMAT */, (IntPtr)1 /* SCF_SELECTION */, ref pf);
+            history.Select(history.TextLength, 0);
+        }
+        catch { }
+    }
+
+    // The first thing in a new chat: hello, and the things it can do right here on the PC.
+    void Welcome()
+    {
+        history.SelectionStart = history.TextLength;
+        history.SelectionFont = new Font("Segoe UI Emoji", 12f, FontStyle.Bold);
+        history.SelectionColor = Ink;
+        history.AppendText("Hi, I'm Monkey \U0001F44B\n");
+        history.SelectionFont = history.Font;
+        history.SelectionColor = Muted;
+        history.AppendText("Ask me anything. I only see what you type here, plus copied text or a file when you add them.\n");
+        var tips = new[] { new[] { "find GST invoice", "search your files and folders" }, new[] { "open excel", "open an app or a folder" },
+                           new[] { "check my laptop", "a health check-up (or just \"battery\")" } };
+        foreach (var tip in tips)
+        {
+            history.SelectionFont = history.Font; history.SelectionColor = Muted; history.AppendText("  •  ");
+            history.SelectionFont = nameFont; history.SelectionColor = Teal; history.AppendText(tip[0]);
+            history.SelectionFont = history.Font; history.SelectionColor = Muted; history.AppendText("   " + tip[1] + "\n");
+        }
+        history.SelectionFont = timeFont; history.SelectionColor = Muted;
+        history.AppendText("Finding, opening and check-ups happen on your PC; none of that is sent anywhere.\n");
+        history.SelectionFont = history.Font; history.SelectionColor = Ink;
+    }
+
+    // Who is speaking, and when: the start of each message.
+    void Header(string who)
+    {
+        StartBlock();
+        history.SelectionFont = nameFont;
+        history.SelectionColor = who == "You" ? Teal : Brown;
+        history.AppendText(who);
+        history.SelectionFont = timeFont;
+        history.SelectionColor = Muted;
+        history.AppendText("   " + DateTime.Now.ToString("h:mm tt", System.Globalization.CultureInfo.InvariantCulture) + "\n");
+        history.SelectionFont = history.Font;
+        history.SelectionColor = Ink;
+        if (who == "You") hasYou = true;
+    }
+
+    // A small gap before the next message or note (none at the very top).
+    void StartBlock()
+    {
+        history.SelectionStart = history.TextLength;
+        if (history.TextLength == 0) return;
+        if (!history.Text.EndsWith("\n")) history.AppendText("\n");
+        history.SelectionFont = spacer;
+        history.AppendText("\n");
     }
 
     // ---- Attaching one file (sent with the next message only) ----
@@ -7081,8 +7788,11 @@ class ChatBox : Form
 
     void ShowStatus()
     {
-        status.Text = busy ? "Monkey is thinking..." : attached != null ? "\U0001F4CE " + System.IO.Path.GetFileName(attached) + "  (click here to remove)" : "";
-        status.Cursor = !busy && attached != null ? Cursors.Hand : Cursors.Default;
+        subtitle.Text = busy ? "Thinking…" : "Your desktop helper  ·  powered by Claude";
+        subtitle.ForeColor = busy ? Teal : Muted;
+        chip.Visible = attached != null;
+        if (attached != null) chip.Text = "   \U0001F4CE  " + System.IO.Path.GetFileName(attached) + "      ✕";
+        send.Enabled = !busy;
     }
 
     // ---- Found files ----
@@ -7110,29 +7820,24 @@ class ChatBox : Form
         history.AppendText(text);
         links.Add(new FileLink { start = start, end = history.TextLength, path = path, folder = folder });
         history.SelectionFont = history.Font;
-        history.SelectionColor = Color.Black;
+        history.SelectionColor = Ink;
     }
 
     public void AddFiles(string heading, List<string> paths)
     {
-        history.SelectionStart = history.TextLength;
-        history.SelectionFont = new Font(history.Font, FontStyle.Bold);
-        history.SelectionColor = Brown;
-        history.AppendText((history.TextLength > 0 ? "\n" : "") + "Monkey:\n");
-        history.SelectionFont = history.Font;
-        history.SelectionColor = Color.Black;
+        Header("Monkey");
         history.AppendText(heading + "\n");
         for (int n = 0; n < paths.Count; n++)
         {
             string p = paths[n];
             bool isDir = System.IO.Directory.Exists(p);
             history.SelectionStart = history.TextLength;
-            history.SelectionColor = Color.Gray;
+            history.SelectionColor = Muted;
             history.AppendText((n + 1) + ". ");
             AppendLink((isDir ? "\U0001F4C1 " : "") + System.IO.Path.GetFileName(p.TrimEnd('\\')), p, false);
             history.SelectionStart = history.TextLength;
             history.SelectionFont = new Font(history.Font.FontFamily, history.Font.Size * 0.85f);
-            history.SelectionColor = Color.Gray;
+            history.SelectionColor = Muted;
             string where = System.IO.Path.GetDirectoryName(p.TrimEnd('\\')) ?? "";
             string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             if (where.StartsWith(home, StringComparison.OrdinalIgnoreCase)) where = "~" + where.Substring(home.Length);
@@ -7142,7 +7847,7 @@ class ChatBox : Form
             AppendLink("folder", p, true);
             history.AppendText("\n");
             history.SelectionFont = history.Font;
-            history.SelectionColor = Color.Black;
+            history.SelectionColor = Ink;
         }
         history.ScrollToCaret();
     }
@@ -7150,9 +7855,11 @@ class ChatBox : Form
     // Links to open (Settings pages and the like): one click each.
     public void AddLinks(string heading, List<KeyValuePair<string, string>> links)
     {
-        history.SelectionStart = history.TextLength;
-        history.SelectionColor = Color.Gray;
+        StartBlock();
+        history.SelectionFont = noteFont;
+        history.SelectionColor = Muted;
         history.AppendText(heading + "\n");
+        history.SelectionFont = history.Font;
         foreach (var l in links)
         {
             history.SelectionStart = history.TextLength;
@@ -7160,24 +7867,21 @@ class ChatBox : Form
             AppendLink("\u25B6 " + l.Key, l.Value, false);
             history.AppendText("\n");
         }
-        history.SelectionColor = Color.Black;
+        history.SelectionColor = Ink;
         history.ScrollToCaret();
     }
 
     // Apps to open: one click each.
     public void AddApps(string heading, List<Monkey.App> apps, bool header)
     {
+        if (header) Header("Monkey");
         history.SelectionStart = history.TextLength;
-        history.SelectionFont = new Font(history.Font, FontStyle.Bold);
-        history.SelectionColor = Brown;
-        if (header) history.AppendText((history.TextLength > 0 ? "\n" : "") + "Monkey:\n");
-        history.SelectionFont = history.Font;
-        history.SelectionColor = Color.Black;
+        history.SelectionColor = Ink;
         history.AppendText(heading + "\n");
         for (int n = 0; n < apps.Count; n++)
         {
             history.SelectionStart = history.TextLength;
-            history.SelectionColor = Color.Gray;
+            history.SelectionColor = Muted;
             history.AppendText((n + 1) + ". ");
             AppendLink("\u25B6 Open " + apps[n].Name, null, false);
             links[links.Count - 1].app = apps[n];
@@ -7186,7 +7890,7 @@ class ChatBox : Form
         history.ScrollToCaret();
     }
 
-    public bool IsEmpty { get { return !history.Text.Contains("You:"); } }
+    public bool IsEmpty { get { return !hasYou; } }
 
     public void FocusInput() { input.Focus(); }
 
@@ -7199,6 +7903,7 @@ class ChatBox : Form
         attached = null;
         if (Send != null) Send(text, useClip.Checked, file);
         useClip.Checked = false;   // copied text and files are only sent when you ask, each time
+        useClip.Invalidate();
         ShowStatus();
     }
 
@@ -7206,18 +7911,12 @@ class ChatBox : Form
     {
         if (!busy && history.TextLength > 0 && !history.Text.EndsWith("\n")) history.AppendText("\n");
         this.busy = busy;
-        send.Enabled = !busy;
         ShowStatus();
     }
 
     public void AddMessage(string who, string text)
     {
-        history.SelectionStart = history.TextLength;
-        history.SelectionFont = new Font(history.Font, FontStyle.Bold);
-        history.SelectionColor = who == "You" ? Teal : Brown;
-        history.AppendText((history.TextLength > 0 ? "\n" : "") + who + ":\n");
-        history.SelectionFont = history.Font;
-        history.SelectionColor = Color.Black;
+        Header(who);
         if (who == "You") history.AppendText(text.Replace("\r\n", "\n") + "\n");
         else { AppendFormatted(text); history.AppendText("\n"); }
         history.ScrollToCaret();
@@ -7251,7 +7950,7 @@ class ChatBox : Form
         history.SelectionStart = history.TextLength;
         history.SelectionFont = family != null ? new Font(family, history.Font.Size)
             : style != FontStyle.Regular ? new Font(history.Font, style) : history.Font;
-        history.SelectionColor = Color.Black;
+        history.SelectionColor = Ink;
         history.AppendText(text);
         history.SelectionFont = history.Font;
     }
@@ -7262,12 +7961,7 @@ class ChatBox : Form
 
     public void BeginReply()
     {
-        history.SelectionStart = history.TextLength;
-        history.SelectionFont = new Font(history.Font, FontStyle.Bold);
-        history.SelectionColor = Brown;
-        history.AppendText((history.TextLength > 0 ? "\n" : "") + "Monkey:\n");
-        history.SelectionFont = history.Font;
-        history.SelectionColor = Color.Black;
+        Header("Monkey");
         replyStart = history.TextLength;
     }
 
@@ -7288,18 +7982,19 @@ class ChatBox : Form
     {
         history.SelectionStart = history.TextLength;
         history.SelectionFont = history.Font;
-        history.SelectionColor = Color.Black;
+        history.SelectionColor = Ink;
         history.AppendText(piece.Replace("\r\n", "\n"));
         history.ScrollToCaret();
     }
 
     public void AddNote(string text)
     {
-        history.SelectionStart = history.TextLength;
-        history.SelectionFont = new Font(history.Font, FontStyle.Italic);
-        history.SelectionColor = Color.Gray;
-        history.AppendText((history.TextLength > 0 ? "\n" : "") + text + "\n");
+        StartBlock();
+        history.SelectionFont = noteFont;
+        history.SelectionColor = Muted;
+        history.AppendText(text + "\n");
         history.SelectionFont = history.Font;
+        history.SelectionColor = Ink;
         history.ScrollToCaret();
     }
 
@@ -7308,6 +8003,109 @@ class ChatBox : Form
         if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }   // keeps the conversation
         base.OnFormClosing(e);
     }
+}
+
+// A flat, rounded button for the chat window: a soft background on hover, or a solid one (like Send).
+// With Toggle it stays on until clicked again. Round makes it a circle.
+class PillButton : Control
+{
+    public Color Back = Color.Transparent, Hover = Color.FromArgb(236, 237, 240), Fore = Color.FromArgb(60, 64, 67), Border = Color.Transparent;
+    public Color OnBack = Color.FromArgb(226, 238, 238), OnFore = Color.FromArgb(38, 104, 106);
+    public bool Toggle, Checked, Round, AlignLeft;
+    public float Radius = 8;
+    bool over, down;
+
+    public PillButton()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint
+            | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+        SetStyle(ControlStyles.Selectable, false);   // clicks don't take the typing cursor away from the message box
+        BackColor = Color.Transparent;
+        Cursor = Cursors.Hand;
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { over = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { over = down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+    protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
+    protected override void OnClick(EventArgs e) { if (Toggle) { Checked = !Checked; Invalidate(); } base.OnClick(e); }
+
+    internal static GraphicsPath Rounded(RectangleF r, float rad)
+    {
+        var path = new GraphicsPath();
+        float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height));
+        if (d < 1) { path.AddRectangle(r); return path; }
+        path.AddArc(r.X, r.Y, d, d, 180, 90);
+        path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
+    static Color Darker(Color c) { return Color.FromArgb(c.A, c.R * 9 / 10, c.G * 9 / 10, c.B * 9 / 10); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        Color bg = !Enabled ? (Back.A > 0 ? Color.FromArgb(200, 204, 208) : Back)
+                 : Checked ? (down ? Darker(OnBack) : OnBack)
+                 : down ? Darker(Hover) : over ? Hover : Back;
+        var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+        using (var path = Rounded(r, Round ? Height / 2f : Radius))
+        {
+            if (bg.A > 0) using (var b = new SolidBrush(bg)) g.FillPath(b, path);
+            if (Border.A > 0) using (var p = new Pen(Border)) g.DrawPath(p, path);
+        }
+        Color fg = !Enabled && Back.A == 0 ? Color.FromArgb(170, 174, 178) : Checked ? OnFore : Fore;
+        var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis
+                  | (AlignLeft ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter);
+        TextRenderer.DrawText(g, Text, Font, Rectangle.Round(r), fg, flags);
+    }
+}
+
+// A panel with rounded corners and a hairline border (the chat card and the message box).
+class RoundPanel : Panel
+{
+    public Color Fill = Color.White, Border = Color.FromArgb(222, 224, 228);
+    public float Radius = 10;
+
+    public RoundPanel()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(BackColor);
+        using (var path = PillButton.Rounded(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), Radius))
+        {
+            using (var b = new SolidBrush(Fill)) g.FillPath(b, path);
+            using (var p = new Pen(Border, Border.ToArgb() == Color.FromArgb(222, 224, 228).ToArgb() ? 1f : 1.5f)) g.DrawPath(p, path);
+        }
+    }
+}
+
+// A text box that shows a grey hint ("Message Monkey...") while it's empty.
+class CueTextBox : TextBox
+{
+    public string Cue = "";
+
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg == 0x0F /* WM_PAINT */ && TextLength == 0 && Cue.Length > 0)
+            using (var g = CreateGraphics())
+                TextRenderer.DrawText(g, Cue, Font, new Rectangle(1, 0, Width - 2, Height), Color.FromArgb(150, 154, 160),
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
+    }
+
+    protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); if (TextLength <= 1) Invalidate(); }
 }
 
 // A click-through window the tab blast is drawn in.
