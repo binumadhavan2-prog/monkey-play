@@ -26,30 +26,40 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.DisplayMetrics;
+import android.view.Choreographer;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 
 import java.util.Calendar;
 
 // Keeps the monkey on screen over other apps. Two windows: a big one it's drawn in, which lets every touch
 // through to the app underneath, and a small invisible one over its body that catches your touches.
+// A third, invisible strip notices when another app goes full screen (a video, a game) so it can step aside.
 public class MonkeyService extends Service implements SensorEventListener, SharedPreferences.OnSharedPreferenceChangeListener {
     static final String ACTION_TOGGLE = "com.binumadhavan.monkeyplay.TOGGLE", ACTION_QUIT = "com.binumadhavan.monkeyplay.QUIT";
+    static final String ACTION_REFRESH = "com.binumadhavan.monkeyplay.REFRESH";
     static final String CHANNEL = "monkey";
-    static volatile boolean running;
+    static volatile boolean running, settingsOpen;
+
+    // Something it shows depends on changed (the settings screen opened or closed).
+    static void refresh(Context c) {
+        if (running) c.startService(new Intent(c, MonkeyService.class).setAction(ACTION_REFRESH));
+    }
 
     WindowManager wm;
     MonkeyView monkey;
-    View hit;
+    View hit, tracker;
     WindowManager.LayoutParams drawLp, hitLp;
     final Handler handler = new Handler(Looper.getMainLooper());
     SharedPreferences prefs;
     SensorManager sensors;
     AudioManager audio;
-    boolean hidden, screenOn = true, shown;
+    boolean hidden, screenOn = true, shown, fullscreen, loopRunning;
     float S;
     int winX, winY, hitSize;
     long lastFrameNanos;
@@ -72,6 +82,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
         sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
         audio = (AudioManager) getSystemService(AUDIO_SERVICE);
         startForegroundNotice();
+        if (!Settings.canDrawOverlays(this)) { stopSelf(); return; }
 
         monkey = new MonkeyView(this);
         hit = new View(this);
@@ -87,17 +98,18 @@ public class MonkeyService extends Service implements SensorEventListener, Share
 
         nextWater = WaterEvery;
         nextEyes = EyesEvery;
-        if (Settings.canDrawOverlays(this)) show();
-        else { stopSelf(); return; }
+        addTracker();
+        updateShown();
         monkey.say(monkey.greeting(), true);
-        handler.post(loop);
+        wake();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String a = intent != null ? intent.getAction() : null;
         if (ACTION_QUIT.equals(a)) { prefs.edit().putBoolean("on", false).apply(); stopSelf(); }
-        else if (ACTION_TOGGLE.equals(a)) { hidden = !hidden; if (hidden) hide(); else show(); startForegroundNotice(); }
+        else if (ACTION_TOGGLE.equals(a)) { hidden = !hidden; updateShown(); startForegroundNotice(); }
+        else if (ACTION_REFRESH.equals(a) && monkey != null) updateShown();
         return START_STICKY;
     }
 
@@ -105,11 +117,13 @@ public class MonkeyService extends Service implements SensorEventListener, Share
     public void onDestroy() {
         running = false;
         handler.removeCallbacksAndMessages(null);
+        Choreographer.getInstance().removeFrameCallback(vsync);
         prefs.unregisterOnSharedPreferenceChangeListener(this);
         try { unregisterReceiver(screenReceiver); } catch (Exception ignored) { }
         try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) { }
         sensors.unregisterListener(this);
         hide();
+        if (tracker != null) try { wm.removeView(tracker); } catch (Exception ignored) { }
         super.onDestroy();
     }
 
@@ -123,6 +137,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
         PendingIntent quit = PendingIntent.getService(this, 2, new Intent(this, MonkeyService.class).setAction(ACTION_QUIT), pf);
         Notification n = new Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notify)
+            .setColor(MainActivity.Teal)
             .setContentTitle(hidden ? "Monkey is taking a break" : "Monkey is hanging around")
             .setContentText("Tap for settings")
             .setContentIntent(open)
@@ -136,41 +151,53 @@ public class MonkeyService extends Service implements SensorEventListener, Share
 
     // ---- Windows ----
 
+    int screenWidth() {
+        if (Build.VERSION.SDK_INT >= 30) return wm.getCurrentWindowMetrics().getBounds().width();
+        DisplayMetrics dm = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(dm);
+        return dm.widthPixels;
+    }
+
+    // Monkey units to screen pixels: Small, Medium or Large, but never so big that it swings off the left edge.
+    static float scaleFor(int size, float density, int screenWidth) {
+        float s = density * (size == 0 ? 0.62f : size == 2 ? 0.98f : 0.8f);
+        return Math.min(s, screenWidth / 410f);
+    }
+
     void applySettings() {
-        int size = prefs.getInt("size", 1);
-        float density = getResources().getDisplayMetrics().density;
-        S = density * (size == 0 ? 0.5f : size == 2 ? 0.75f : 0.62f);
+        S = scaleFor(prefs.getInt("size", 1), getResources().getDisplayMetrics().density, screenWidth());
         monkey.S = S;
+        monkey.woodBitmap = null;
         monkey.tiltOn = prefs.getBoolean("tilt", true);
         updateSensors();
-        if (shown) { hide(); show(); }
+        if (shown) { hide(); updateShown(); }
     }
 
     @Override
     public void onSharedPreferenceChanged(SharedPreferences p, String key) {
         if ("size".equals(key) || "tilt".equals(key)) applySettings();
+        else if ("fullscreen".equals(key)) updateShown();
     }
 
     @Override
     public void onConfigurationChanged(Configuration c) {
         super.onConfigurationChanged(c);
-        if (shown) { hide(); show(); }   // turned the phone: back to the top-right corner
+        applySettings();   // turned the phone: back to the top-right corner, sized for the new width
     }
 
     void place() {
-        int width;
-        if (Build.VERSION.SDK_INT >= 30) width = wm.getCurrentWindowMetrics().getBounds().width();
-        else {
-            android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
-            wm.getDefaultDisplay().getRealMetrics(dm);
-            width = dm.widthPixels;
-        }
         int top = 0;
         int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
         if (id > 0) top = getResources().getDimensionPixelSize(id);
         // The branch near the top-right, coming out from under the status bar (the tree is up there).
-        winX = Math.round(width - 230 * S - MonkeyView.PX * S);
-        winY = top;
+        winX = Math.round(screenWidth() - 230 * S - MonkeyView.PX * S);
+        winY = top - Math.round(10 * S);   // sitting, its tuft just clears the status bar
+    }
+
+    // Shown unless you hid it, the settings screen is open (it has its own monkey), or another app is full screen.
+    void updateShown() {
+        boolean want = !hidden && !settingsOpen && !(fullscreen && prefs.getBoolean("fullscreen", true));
+        if (want) show(); else hide();
     }
 
     void show() {
@@ -185,8 +212,9 @@ public class MonkeyService extends Service implements SensorEventListener, Share
             PixelFormat.TRANSLUCENT);
         drawLp.gravity = Gravity.TOP | Gravity.LEFT;
         drawLp.x = winX; drawLp.y = winY;
-        // Android only lets touches through an overlay to the app below when it's at most 80% opaque.
-        drawLp.alpha = 0.8f;
+        // From Android 12, touches only pass through an overlay to the app below when it's at most 80% opaque.
+        // Before that it can be drawn in full colour.
+        drawLp.alpha = Build.VERSION.SDK_INT >= 31 ? 0.8f : 1f;
         drawLp.setTitle("Monkey");
         hitSize = Math.round(110 * S);
         hitLp = new WindowManager.LayoutParams(hitSize, hitSize, type,
@@ -200,6 +228,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
         wm.addView(hit, hitLp);
         shown = true;
         updateSensors();
+        wake();
     }
 
     void hide() {
@@ -220,6 +249,36 @@ public class MonkeyService extends Service implements SensorEventListener, Share
         if (shown) wm.updateViewLayout(hit, hitLp);
     }
 
+    // An invisible, untouchable strip down the left edge. When the status bar disappears for another app
+    // (a full-screen video or game), it notices, and the monkey steps aside until it's back.
+    void addTracker() {
+        tracker = new View(this);
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(1, WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+        lp.setTitle("Monkey fullscreen check");
+        tracker.setOnApplyWindowInsetsListener((v, insets) -> {
+            boolean full = Build.VERSION.SDK_INT >= 30 ? !insets.isVisible(WindowInsets.Type.statusBars()) : insets.getSystemWindowInsetTop() == 0;
+            setFullscreen(full);
+            return insets;
+        });
+        if (Build.VERSION.SDK_INT < 30)
+            tracker.setOnSystemUiVisibilityChangeListener(vis -> setFullscreen((vis & View.SYSTEM_UI_FLAG_FULLSCREEN) != 0));
+        try { wm.addView(tracker, lp); } catch (Exception e) { tracker = null; }
+    }
+
+    void setFullscreen(boolean full) {
+        if (full == fullscreen) return;
+        fullscreen = full;
+        // A moment's grace, so a quick flicker of the status bar doesn't make it jump.
+        handler.removeCallbacks(applyFullscreen);
+        handler.postDelayed(applyFullscreen, full ? 600 : 300);
+    }
+
+    final Runnable applyFullscreen = this::updateShown;
+
     // ---- Touch ----
 
     final Runnable longPress = () -> {
@@ -237,7 +296,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
             case MotionEvent.ACTION_DOWN:
                 monkey.touchDown(wx, wy);
                 handler.postDelayed(longPress, 700);
-                kick();
+                wake();
                 return true;
             case MotionEvent.ACTION_MOVE:
                 monkey.touchMove(wx, wy);
@@ -264,26 +323,32 @@ public class MonkeyService extends Service implements SensorEventListener, Share
     }
 
     // ---- The frame loop ----
+    // While it moves, a frame for every screen refresh (smooth); when it's calm, only as many as it needs.
 
-    final Runnable loop = new Runnable() {
-        @Override public void run() {
-            if (!running) return;
-            long now = SystemClock.elapsedRealtimeNanos();
-            double dt = lastFrameNanos == 0 ? 1 / 60.0 : (now - lastFrameNanos) / 1e9;
-            lastFrameNanos = now;
-            if (shown && screenOn) {
-                checks();
-                monkey.frame(dt);
-                moveHit(false);
-                handler.postDelayed(this, Math.max(4, Math.round(monkey.frameInterval() * 1000)));
-            } else handler.postDelayed(this, 500);   // nobody can see it: nothing to draw
-        }
-    };
+    void step() {
+        if (!running || !shown || !screenOn) { loopRunning = false; return; }
+        long now = SystemClock.elapsedRealtimeNanos();
+        double dt = lastFrameNanos == 0 ? 1 / 60.0 : (now - lastFrameNanos) / 1e9;
+        lastFrameNanos = now;
+        checks();
+        monkey.frame(dt);
+        moveHit(false);
+        double wait = monkey.frameInterval();
+        if (wait <= 0) Choreographer.getInstance().postFrameCallback(vsync);
+        else handler.postDelayed(timed, Math.round(wait * 1000));
+    }
 
-    void kick() {
-        // Wake the loop straight away (it may be waiting a while between calm frames).
-        handler.removeCallbacks(loop);
-        handler.post(loop);
+    final Choreographer.FrameCallback vsync = n -> step();
+    final Runnable timed = this::step;
+
+    // Starts the loop, or wakes it straight away if it's waiting a while between calm frames.
+    void wake() {
+        if (!running || !shown || !screenOn) return;
+        handler.removeCallbacks(timed);
+        Choreographer.getInstance().removeFrameCallback(vsync);
+        if (!loopRunning) lastFrameNanos = 0;
+        loopRunning = true;
+        Choreographer.getInstance().postFrameCallback(vsync);
     }
 
     // Once a second: music, reminders and the hourly chime.
@@ -295,12 +360,12 @@ public class MonkeyService extends Service implements SensorEventListener, Share
         if (music && !monkey.musicOn) monkey.say(monkey.pick("Ooh, I love this song!", "Let's dance!", "Nice beat!", "Turn it up!"), false);
         monkey.musicOn = music;
 
-        boolean free = !monkey.grabbed && monkey.sleepW < 0.05f && monkey.act == MonkeyView.Act.None;
+        boolean free = monkey.free();
         if (!prefs.getBoolean("reminders", true)) { nextWater = Math.max(nextWater, now + WaterEvery); nextEyes = Math.max(nextEyes, now + EyesEvery); }
         else if (free && now >= nextWater) {
             nextWater = now + WaterEvery;
+            monkey.startDrink();
             monkey.say(monkey.pick("Water break! Take a sip.", "Time to drink some water!", "Hydration time! Have a sip."), true, 4.5);
-            monkey.grinTime = 1;
         } else if (free && now >= nextEyes) {
             nextEyes = now + EyesEvery;
             monkey.startEyeRest();
@@ -326,7 +391,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
         @Override public void onReceive(Context c, Intent i) {
             String a = i.getAction();
             if (Intent.ACTION_SCREEN_OFF.equals(a)) screenOn = false;
-            else if (Intent.ACTION_SCREEN_ON.equals(a)) { screenOn = true; lastFrameNanos = 0; }
+            else if (Intent.ACTION_SCREEN_ON.equals(a)) screenOn = true;
             else if (Intent.ACTION_USER_PRESENT.equals(a) && shown) {
                 // Unlocked: it's pleased to see you.
                 monkey.wakeUp();
@@ -334,7 +399,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
                 monkey.say(monkey.pick("Welcome back!", "Oh, hi again!", "There you are!"), true);
             }
             updateSensors();
-            kick();
+            wake();
         }
     };
 
@@ -358,7 +423,7 @@ public class MonkeyService extends Service implements SensorEventListener, Share
 
     void updateSensors() {
         sensors.unregisterListener(this);
-        if (!shown || !screenOn) return;
+        if (!shown || !screenOn || !prefs.getBoolean("tilt", true)) { monkey.tiltX = 0; return; }
         Sensor acc = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
         if (acc != null) sensors.registerListener(this, acc, SensorManager.SENSOR_DELAY_UI);
     }
@@ -379,14 +444,16 @@ public class MonkeyService extends Service implements SensorEventListener, Share
             case Surface.ROTATION_270: gx = -grav[1]; jx = ly; jy = lx; break;
             default: gx = -grav[0]; jx = lx; jy = -ly; break;
         }
-        monkey.tiltX = Math.max(-1, Math.min(1, gx / SensorManager.GRAVITY_EARTH));
+        double tilt = Math.max(-1, Math.min(1, gx / SensorManager.GRAVITY_EARTH));
+        if (Math.abs(tilt - monkey.tiltX) > 0.08) wake();   // it'll swing: smooth frames
+        monkey.tiltX = tilt;
         // A shake throws it about.
         double quick = Math.sqrt(lx * lx + ly * ly + lz * lz);
-        if (quick > 9 && monkey.tiltOn && !monkey.grabbed) {
+        if (quick > 9 && !monkey.grabbed) {
             monkey.jolt(-jx * 60, -jy * 60);   // the phone moves, the monkey's left behind
             if (monkey.clock - lastShake > 4) monkey.say(monkey.pick("Whoa! Earthquake!", "Easy there!", "Wheee! Again!"), true);
             lastShake = monkey.clock;
-            kick();
+            wake();
         }
     }
 

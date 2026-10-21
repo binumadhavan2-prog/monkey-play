@@ -27,7 +27,7 @@ mkdir out\gen out\classes out\dex
 rem Resources (icons, colours) and the manifest.
 "%BT%\aapt2.exe" compile --dir res -o out\res.zip || exit /b 1
 "%BT%\aapt2.exe" link -o out\app.unaligned.apk -I "%JAR%" --manifest AndroidManifest.xml --java out\gen ^
-    --min-sdk-version 26 --target-sdk-version 34 --version-code 1 --version-name 1.0 out\res.zip || exit /b 1
+    --min-sdk-version 26 --target-sdk-version 34 --version-code 2 --version-name 1.1 out\res.zip || exit /b 1
 
 rem The code.
 javac -nowarn -Xlint:-options -source 8 -target 8 -encoding UTF-8 -bootclasspath "%JAR%;%BT%\core-lambda-stubs.jar" -d out\classes ^
