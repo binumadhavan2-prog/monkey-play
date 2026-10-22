@@ -69,6 +69,16 @@ android\build.cmd
 
 This makes `android\Monkey Play.apk`. Copy it to your phone and open it to install (allow installing from that app when asked), or with USB debugging on: `adb install -r "android\Monkey Play.apk"`. Open **Monkey Play**, tap **Allow Monkey over other apps**, switch it on, and come back.
 
+### Install updates on your phone from the PC
+
+`android\install.cmd` builds the app and installs it straight onto your phone over Wi-Fi or a USB cable, as an update (your settings in the app are kept), then opens it.
+
+1. On the phone, once: **Settings → About phone**, tap **Build number** 7 times. Then **Settings → Developer options**: turn on **Wireless debugging** (phone and PC on the same Wi-Fi) or **USB debugging** (for a cable).
+2. Wi-Fi, the first time: run `android\install.cmd pair`, and type the address and code from **Wireless debugging → Pair device with pairing code**, then the **IP address & Port** from the main Wireless debugging screen. With a cable, just tap **Allow** on the phone.
+3. After that, run `android\install.cmd` for each update (`install.cmd nobuild` reinstalls the last build).
+
+The phone's Wi-Fi debugging port changes when Wireless debugging is turned off and on; if the phone isn't found, run `android\install.cmd wifi` with the new address. From PowerShell, run it as `cmd /c android\install.cmd` (calling it directly breaks on the space in the folder name). If the install says *not enough space*, free up storage on the phone.
+
 ## Download
 
 Get `Monkey-Play.exe` from the [latest release](https://github.com/binumadhavan2-prog/monkey-play/releases/latest) and run it. There's nothing to install.
